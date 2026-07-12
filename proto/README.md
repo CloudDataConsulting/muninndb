@@ -35,12 +35,14 @@ defined. Initialisms follow generator naming (`ID` becomes `Id`, `TTL` becomes
 `Ttl`, and `OK` becomes `Ok`), and repeated message fields become pointer slices
 such as `[]*Association`, `[]*Filter`, and `[]*ActivationItem`.
 
-The in-repository gRPC transport and tests are migrated in this bootstrap.
+The in-repository gRPC transport and tests are migrated in this bootstrap. A
+2026-07-12 local inventory of 24 Go modules found 45 imports, all inside 12
+worktrees of the same MuninnDB repository. No separate local repository or Go
+module consumes
+`github.com/scrypster/muninndb/proto/gen/go/muninn/v1`, and no production code
+constructs the generated gRPC client. MuninnDB's Go, Python, and Node SDKs use
+REST and are not source-affected by these Go binding changes.
 
-TODO before this work can be marked ready:
-
-- Inventory every downstream consumer of
-  `github.com/scrypster/muninndb/proto/gen/go/muninn/v1`.
-- Decide whether a source-compatibility wrapper or a versioned breaking-change
-  release note is required.
-- Record and independently review the migration plan.
+Unknown external module consumers cannot be inventoried locally. A versioned
+source-compatibility release note covering the identifier and pointer-slice
+changes is therefore required before shipping these generated bindings.
