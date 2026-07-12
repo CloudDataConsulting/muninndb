@@ -554,36 +554,51 @@ func TestGetMetadataCacheIsVaultScoped(t *testing.T) {
 		t.Fatal("different vaults returned the same metadata cache object")
 	}
 
-	overwriteB := &Engram{ID: id, Concept: "vault B overwrite", Content: "new metadata", Confidence: 0.55, Relevance: 0.45}
-	if _, err := store.WriteEngram(ctx, workspaceB, overwriteB); err != nil {
-		t.Fatalf("WriteEngram(overwrite workspaceB): %v", err)
+	// Canonical write APIs are insert-only. Exercise legal metadata mutations
+	// after both same-ULID cache entries are hot, and verify invalidation remains
+	// scoped to the mutated vault.
+	updatedB := *metasB[0]
+	updatedB.Confidence = 0.55
+	if err := store.UpdateMetadata(ctx, workspaceB, id, &updatedB); err != nil {
+		t.Fatalf("UpdateMetadata(workspaceB): %v", err)
 	}
 	metasB, err = store.GetMetadata(ctx, workspaceB, []ULID{id})
-	if err != nil || len(metasB) != 1 || metasB[0] == nil || metasB[0].Confidence != overwriteB.Confidence {
-		t.Fatalf("GetMetadata(workspaceB after overwrite) = %v, %v", metasB, err)
-	}
-
-	overwriteA := &Engram{ID: id, Concept: "vault A batch overwrite", Content: "new batch metadata", Confidence: 0.65, Relevance: 0.6}
-	batch := store.NewBatch()
-	defer batch.Discard()
-	if err := batch.WriteEngram(ctx, workspaceA, overwriteA); err != nil {
-		t.Fatalf("batch.WriteEngram(overwrite workspaceA): %v", err)
-	}
-	if err := batch.Commit(); err != nil {
-		t.Fatalf("batch.Commit: %v", err)
+	if err != nil || len(metasB) != 1 || metasB[0] == nil || metasB[0].Confidence != updatedB.Confidence {
+		t.Fatalf("GetMetadata(workspaceB after metadata update) = %v, %v", metasB, err)
 	}
 	metasA, err = store.GetMetadata(ctx, workspaceA, []ULID{id})
-	if err != nil || len(metasA) != 1 || metasA[0] == nil || metasA[0].Confidence != overwriteA.Confidence {
-		t.Fatalf("GetMetadata(workspaceA after batch overwrite) = %v, %v", metasA, err)
+	if err != nil || len(metasA) != 1 || metasA[0] == nil || metasA[0].Confidence != engramA.Confidence {
+		t.Fatalf("GetMetadata(workspaceA after workspaceB metadata update) = %v, %v", metasA, err)
 	}
 
-	overwriteB = &Engram{ID: id, Concept: "vault B bulk overwrite", Content: "new bulk metadata", Confidence: 0.75, Relevance: 0.7}
-	_, writeErrs := store.WriteEngramBatch(ctx, []EngramBatchItem{{WSPrefix: workspaceB, Engram: overwriteB}})
-	if len(writeErrs) != 1 || writeErrs[0] != nil {
-		t.Fatalf("WriteEngramBatch errors=%v", writeErrs)
+	vec := make([]float32, 384)
+	vec[0] = 0.25
+	if err := store.UpdateEmbedding(ctx, workspaceA, id, vec); err != nil {
+		t.Fatalf("UpdateEmbedding(workspaceA): %v", err)
+	}
+	metasA, err = store.GetMetadata(ctx, workspaceA, []ULID{id})
+	if err != nil || len(metasA) != 1 || metasA[0] == nil || metasA[0].EmbedDim != Embed384 {
+		t.Fatalf("GetMetadata(workspaceA after embedding update) = %v, %v", metasA, err)
 	}
 	metasB, err = store.GetMetadata(ctx, workspaceB, []ULID{id})
-	if err != nil || len(metasB) != 1 || metasB[0] == nil || metasB[0].Confidence != overwriteB.Confidence {
-		t.Fatalf("GetMetadata(workspaceB after bulk overwrite) = %v, %v", metasB, err)
+	if err != nil || len(metasB) != 1 || metasB[0] == nil || metasB[0].EmbedDim != EmbedNone {
+		t.Fatalf("GetMetadata(workspaceB after workspaceA embedding update) = %v, %v", metasB, err)
+	}
+
+	batch := store.NewBatch()
+	defer batch.Discard()
+	if err := batch.UpdateEngramState(ctx, workspaceB, id, StateSoftDeleted); err != nil {
+		t.Fatalf("batch.UpdateEngramState(workspaceB): %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("batch.Commit(state update): %v", err)
+	}
+	metasB, err = store.GetMetadata(ctx, workspaceB, []ULID{id})
+	if err != nil || len(metasB) != 1 || metasB[0] == nil || metasB[0].State != StateSoftDeleted {
+		t.Fatalf("GetMetadata(workspaceB after state update) = %v, %v", metasB, err)
+	}
+	metasA, err = store.GetMetadata(ctx, workspaceA, []ULID{id})
+	if err != nil || len(metasA) != 1 || metasA[0] == nil || metasA[0].State != StateActive {
+		t.Fatalf("GetMetadata(workspaceA after workspaceB state update) = %v, %v", metasA, err)
 	}
 }
