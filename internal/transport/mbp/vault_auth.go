@@ -50,6 +50,9 @@ func withConnectionSession(ctx context.Context, session *connectionSession) cont
 	if session.key != nil {
 		key := *session.key
 		ctx = context.WithValue(ctx, auth.ContextAPIKey, &key)
+		ctx = context.WithValue(ctx, auth.ContextPrincipal, auth.PrincipalAPIKey)
+	} else {
+		ctx = context.WithValue(ctx, auth.ContextPrincipal, auth.PrincipalPublic)
 	}
 	return ctx
 }

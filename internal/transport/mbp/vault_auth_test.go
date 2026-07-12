@@ -17,9 +17,10 @@ import (
 )
 
 type wireCall struct {
-	op    string
-	vault string
-	mode  string
+	op        string
+	vault     string
+	mode      string
+	principal auth.PrincipalKind
 }
 
 type wireAuthEngine struct {
@@ -37,7 +38,7 @@ type wireAuthEngine struct {
 func (e *wireAuthEngine) record(ctx context.Context, op, vault string) {
 	mode, _ := ctx.Value(auth.ContextMode).(string)
 	e.mu.Lock()
-	e.calls = append(e.calls, wireCall{op: op, vault: vault, mode: mode})
+	e.calls = append(e.calls, wireCall{op: op, vault: vault, mode: mode, principal: auth.PrincipalFromContext(ctx)})
 	e.mu.Unlock()
 }
 
@@ -210,8 +211,8 @@ func TestMBPHelloBindsVaultAndMode(t *testing.T) {
 		if response.VaultID != "public" {
 			t.Fatalf("HELLO_OK vault = %q, want public", response.VaultID)
 		}
-		if got := engine.helloCall(); got.vault != "public" || got.mode != auth.ModeFull {
-			t.Fatalf("engine HELLO call = %+v, want public/full", got)
+		if got := engine.helloCall(); got.vault != "public" || got.mode != auth.ModeFull || got.principal != auth.PrincipalPublic {
+			t.Fatalf("engine HELLO call = %+v, want public/full/public principal", got)
 		}
 	})
 
@@ -250,8 +251,8 @@ func TestMBPHelloBindsVaultAndMode(t *testing.T) {
 		if frame.Type != TypeHelloOK {
 			assertWireError(t, frame, ErrAuthFailed)
 		}
-		if got := engine.helloCall(); got.vault != "private" || got.mode != auth.ModeObserve {
-			t.Fatalf("engine HELLO call = %+v, want private/observe", got)
+		if got := engine.helloCall(); got.vault != "private" || got.mode != auth.ModeObserve || got.principal != auth.PrincipalAPIKey {
+			t.Fatalf("engine HELLO call = %+v, want private/observe/api-key principal", got)
 		}
 	})
 
@@ -443,8 +444,8 @@ func TestMBPEmptyVaultPinnedForEveryRequestType(t *testing.T) {
 		}
 	}
 	for _, call := range engine.nonHelloCalls() {
-		if call.vault != "private" || call.mode != auth.ModeFull {
-			t.Fatalf("engine call not pinned to private/full: %+v", call)
+		if call.vault != "private" || call.mode != auth.ModeFull || call.principal != auth.PrincipalAPIKey {
+			t.Fatalf("engine call not pinned to private/full/api-key principal: %+v", call)
 		}
 	}
 }
@@ -478,7 +479,7 @@ func TestMBPModeEnforcement(t *testing.T) {
 			t.Fatalf("observe ping response = 0x%02x", frame.Type)
 		}
 		calls := engine.nonHelloCalls()
-		if len(calls) != 1 || calls[0].op != "read" || calls[0].mode != auth.ModeObserve {
+		if len(calls) != 1 || calls[0].op != "read" || calls[0].mode != auth.ModeObserve || calls[0].principal != auth.PrincipalAPIKey {
 			t.Fatalf("unexpected observe engine calls: %+v", calls)
 		}
 	})
@@ -512,7 +513,7 @@ func TestMBPModeEnforcement(t *testing.T) {
 			t.Fatalf("write-only ping response = 0x%02x", frame.Type)
 		}
 		calls := engine.nonHelloCalls()
-		if len(calls) != 1 || calls[0].op != "write" || calls[0].mode != auth.ModeWrite {
+		if len(calls) != 1 || calls[0].op != "write" || calls[0].mode != auth.ModeWrite || calls[0].principal != auth.PrincipalAPIKey {
 			t.Fatalf("unexpected write-only engine calls: %+v", calls)
 		}
 	})
