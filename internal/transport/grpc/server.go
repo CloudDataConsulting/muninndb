@@ -690,12 +690,12 @@ func (s *Server) Subscribe(stream pb.MuninnDB_SubscribeServer) error {
 	// Subscription identifiers are server-assigned. Accepting a caller-selected
 	// global ID would let one stream replace and later remove another stream's
 	// subscription in the engine registry.
-	if req.SubscriptionID != "" {
+	if req.SubscriptionId != "" {
 		return status.Error(codes.InvalidArgument, "subscription_id must be empty; the server assigns it")
 	}
 	ctx = context.WithValue(ctx, auth.ContextVault, vault)
 	assignedSubID := uuid.NewString()
-	req.SubscriptionID = assignedSubID
+	req.SubscriptionId = assignedSubID
 
 	// Buffered push channel. The deliver func is non-blocking: it drops the push
 	// if the channel is full so the trigger worker goroutine is never blocked.
@@ -732,7 +732,7 @@ func (s *Server) Subscribe(stream pb.MuninnDB_SubscribeServer) error {
 
 	// Confirm subscription to the client.
 	if err := stream.Send(&pb.ActivationPush{
-		SubscriptionID: assignedSubID,
+		SubscriptionId: assignedSubID,
 		Trigger:        "subscription_created",
 		At:             time.Now().UnixNano(),
 	}); err != nil {
@@ -751,14 +751,14 @@ func (s *Server) Subscribe(stream pb.MuninnDB_SubscribeServer) error {
 				return streamTerminationError(ctx)
 			}
 			pbPush := &pb.ActivationPush{
-				SubscriptionID: assignedSubID,
+				SubscriptionId: assignedSubID,
 				Trigger:        string(push.Trigger),
 				PushNumber:     int32(push.PushNumber),
 				At:             push.At.UnixNano(),
 			}
 			if push.Engram != nil {
 				pbPush.Activation = &pb.ActivationItem{
-					ID:      push.Engram.ID.String(),
+					Id:      push.Engram.ID.String(),
 					Concept: push.Engram.Concept,
 					Content: push.Engram.Content,
 					Score:   float32(push.Score),

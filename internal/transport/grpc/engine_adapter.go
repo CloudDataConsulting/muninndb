@@ -31,51 +31,57 @@ func (a *grpcEngineAdapter) Hello(ctx context.Context, req *pb.HelloRequest) (*p
 	}
 	return &pb.HelloResponse{
 		ServerVersion: resp.ServerVersion,
-		SessionID:     resp.SessionID,
-		VaultID:       resp.VaultID,
+		SessionId:     resp.SessionID,
+		VaultId:       resp.VaultID,
 		Capabilities:  resp.Capabilities,
 	}, nil
 }
 
 func (a *grpcEngineAdapter) Write(ctx context.Context, req *pb.WriteRequest) (*pb.WriteResponse, error) {
-	mbpAssocs := make([]mbp.Association, len(req.Associations))
-	for i, assoc := range req.Associations {
-		mbpAssocs[i] = mbp.Association{
-			TargetID: assoc.TargetID, RelType: uint16(assoc.RelType),
+	mbpAssocs := make([]mbp.Association, 0, len(req.Associations))
+	for _, assoc := range req.Associations {
+		if assoc == nil {
+			continue
+		}
+		mbpAssocs = append(mbpAssocs, mbp.Association{
+			TargetID: assoc.TargetId, RelType: uint16(assoc.RelType),
 			Weight: assoc.Weight, Confidence: assoc.Confidence,
 			CreatedAt: assoc.CreatedAt, LastActivated: assoc.LastActivated,
-		}
+		})
 	}
 	// NOTE: Inline enrichment fields (Summary, Entities, Relationships) are not yet
 	// in the proto schema. They pass through as zero values until the proto is updated.
 	resp, err := a.eng.Write(ctx, &mbp.WriteRequest{
 		Concept: req.Concept, Content: req.Content, Tags: req.Tags,
 		Confidence: req.Confidence, Stability: req.Stability, Vault: req.Vault,
-		IdempotentID: req.IdempotentID, Associations: mbpAssocs, Embedding: req.Embedding,
+		IdempotentID: req.IdempotentId, Associations: mbpAssocs, Embedding: req.Embedding,
 		MemoryType: uint8(req.MemoryType), TypeLabel: req.TypeLabel,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &pb.WriteResponse{ID: resp.ID, CreatedAt: resp.CreatedAt}, nil
+	return &pb.WriteResponse{Id: resp.ID, CreatedAt: resp.CreatedAt}, nil
 }
 
 func (a *grpcEngineAdapter) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb.BatchWriteResponse, error) {
 	mbpReqs := make([]*mbp.WriteRequest, len(req.Requests))
 	for i, r := range req.Requests {
-		mbpAssocs := make([]mbp.Association, len(r.Associations))
-		for j, assoc := range r.Associations {
-			mbpAssocs[j] = mbp.Association{
-				TargetID: assoc.TargetID, RelType: uint16(assoc.RelType),
+		mbpAssocs := make([]mbp.Association, 0, len(r.Associations))
+		for _, assoc := range r.Associations {
+			if assoc == nil {
+				continue
+			}
+			mbpAssocs = append(mbpAssocs, mbp.Association{
+				TargetID: assoc.TargetId, RelType: uint16(assoc.RelType),
 				Weight: assoc.Weight, Confidence: assoc.Confidence,
 				CreatedAt: assoc.CreatedAt, LastActivated: assoc.LastActivated,
-			}
+			})
 		}
 		// NOTE: Inline enrichment fields not yet in proto (see single Write).
 		mbpReqs[i] = &mbp.WriteRequest{
 			Concept: r.Concept, Content: r.Content, Tags: r.Tags,
 			Confidence: r.Confidence, Stability: r.Stability, Vault: r.Vault,
-			IdempotentID: r.IdempotentID, Associations: mbpAssocs, Embedding: r.Embedding,
+			IdempotentID: r.IdempotentId, Associations: mbpAssocs, Embedding: r.Embedding,
 			MemoryType: uint8(r.MemoryType), TypeLabel: r.TypeLabel,
 		}
 	}
@@ -94,12 +100,12 @@ func (a *grpcEngineAdapter) BatchWrite(ctx context.Context, req *pb.BatchWriteRe
 }
 
 func (a *grpcEngineAdapter) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadResponse, error) {
-	resp, err := a.eng.Read(ctx, &mbp.ReadRequest{ID: req.ID, Vault: req.Vault})
+	resp, err := a.eng.Read(ctx, &mbp.ReadRequest{ID: req.Id, Vault: req.Vault})
 	if err != nil {
 		return nil, err
 	}
 	return &pb.ReadResponse{
-		ID: resp.ID, Concept: resp.Concept, Content: resp.Content,
+		Id: resp.ID, Concept: resp.Concept, Content: resp.Content,
 		Confidence: resp.Confidence, Relevance: resp.Relevance, Tags: resp.Tags,
 		State: uint32(resp.State), CreatedAt: resp.CreatedAt, UpdatedAt: resp.UpdatedAt,
 		LastAccess: resp.LastAccess, AccessCount: uint32(resp.AccessCount), Stability: resp.Stability,
@@ -115,36 +121,36 @@ func (a *grpcEngineAdapter) Activate(ctx context.Context, req *pb.ActivateReques
 	if err != nil {
 		return nil, err
 	}
-	items := make([]pb.ActivationItem, len(resp.Activations))
+	items := make([]*pb.ActivationItem, len(resp.Activations))
 	for i, item := range resp.Activations {
-		items[i] = pb.ActivationItem{
-			ID: item.ID, Concept: item.Concept, Content: item.Content,
+		items[i] = &pb.ActivationItem{
+			Id: item.ID, Concept: item.Concept, Content: item.Content,
 			Score: item.Score, Why: item.Why,
 		}
 	}
 	return &pb.ActivateResponse{
-		QueryID: resp.QueryID, TotalFound: int32(resp.TotalFound),
+		QueryId: resp.QueryID, TotalFound: int32(resp.TotalFound),
 		Activations: items, LatencyMs: resp.LatencyMs,
 	}, nil
 }
 
 func (a *grpcEngineAdapter) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error) {
 	resp, err := a.eng.Link(ctx, &mbp.LinkRequest{
-		SourceID: req.SourceID, TargetID: req.TargetID,
+		SourceID: req.SourceId, TargetID: req.TargetId,
 		RelType: uint16(req.RelType), Weight: req.Weight, Vault: req.Vault,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &pb.LinkResponse{OK: resp.OK}, nil
+	return &pb.LinkResponse{Ok: resp.OK}, nil
 }
 
 func (a *grpcEngineAdapter) Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error) {
-	resp, err := a.eng.Forget(ctx, &mbp.ForgetRequest{ID: req.ID, Hard: req.Hard, Vault: req.Vault})
+	resp, err := a.eng.Forget(ctx, &mbp.ForgetRequest{ID: req.Id, Hard: req.Hard, Vault: req.Vault})
 	if err != nil {
 		return nil, err
 	}
-	return &pb.ForgetResponse{OK: resp.OK}, nil
+	return &pb.ForgetResponse{Ok: resp.OK}, nil
 }
 
 func (a *grpcEngineAdapter) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
@@ -160,20 +166,20 @@ func (a *grpcEngineAdapter) Stat(ctx context.Context, req *pb.StatRequest) (*pb.
 
 func (a *grpcEngineAdapter) Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error) {
 	resp, err := a.eng.Subscribe(ctx, &mbp.SubscribeRequest{
-		SubscriptionID: req.SubscriptionID, Context: req.Context,
-		Threshold: req.Threshold, Vault: req.Vault, TTL: int(req.TTL),
+		SubscriptionID: req.SubscriptionId, Context: req.Context,
+		Threshold: req.Threshold, Vault: req.Vault, TTL: int(req.Ttl),
 		RateLimit: int(req.RateLimit), PushOnWrite: req.PushOnWrite, DeltaThreshold: req.DeltaThreshold,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &pb.SubscribeResponse{SubID: resp.SubID, Status: resp.Status}, nil
+	return &pb.SubscribeResponse{SubId: resp.SubID, Status: resp.Status}, nil
 }
 
 func (a *grpcEngineAdapter) SubscribeWithDeliver(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error) {
 	return a.eng.SubscribeWithDeliver(ctx, &mbp.SubscribeRequest{
-		SubscriptionID: req.SubscriptionID, Context: req.Context,
-		Threshold: req.Threshold, Vault: req.Vault, TTL: int(req.TTL),
+		SubscriptionID: req.SubscriptionId, Context: req.Context,
+		Threshold: req.Threshold, Vault: req.Vault, TTL: int(req.Ttl),
 		RateLimit: int(req.RateLimit), PushOnWrite: req.PushOnWrite, DeltaThreshold: req.DeltaThreshold,
 	}, deliver)
 }

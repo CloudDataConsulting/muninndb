@@ -1,0 +1,8 @@
+version: v2
+
+modules:
+  - path: proto
+
+# This configuration intentionally does not impose Buf's stylistic lint rules
+# on the existing public v1 API. The hosted generation workflow uses `buf build`
+# for schema validation and Go descriptor tests for the frozen wire contract.

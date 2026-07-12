@@ -1,5 +1,6 @@
-// Code generated manually for MuninnDB. DO NOT EDIT.
-// This file provides gRPC service interfaces for MuninnDB.
+// BOOTSTRAP ONLY: this handwritten service file is not canonical generator
+// output. The pinned gRPC protobuf contract workflow must replace it together
+// with service.pb.go before this branch is reviewable.
 
 package muninn_v1
 
