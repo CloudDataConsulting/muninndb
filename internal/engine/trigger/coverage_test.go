@@ -105,12 +105,12 @@ func TestTriggerSystem_NotifyWrite(t *testing.T) {
 		Confidence: 0.9,
 	}
 
-	ts.NotifyWrite(42, eng, true)
+	ts.NotifyWrite(testWorkspace(42), eng, true)
 
 	select {
 	case ev := <-ts.WriteEvents:
-		if ev.VaultID != 42 {
-			t.Errorf("VaultID = %d, want 42", ev.VaultID)
+		if ev.Workspace != testWorkspace(42) {
+			t.Errorf("Workspace = %v, want %v", ev.Workspace, testWorkspace(42))
 		}
 		if ev.Engram != eng {
 			t.Error("Engram pointer mismatch")
@@ -129,13 +129,13 @@ func TestTriggerSystem_NotifyWrite_BufferFull(t *testing.T) {
 
 	// Fill the buffer.
 	for i := 0; i < writeEventBufSize; i++ {
-		ts.NotifyWrite(1, eng, true)
+		ts.NotifyWrite(testWorkspace(1), eng, true)
 	}
 
 	// This call should silently drop (not panic or block).
 	done := make(chan struct{})
 	go func() {
-		ts.NotifyWrite(1, eng, true)
+		ts.NotifyWrite(testWorkspace(1), eng, true)
 		close(done)
 	}()
 
@@ -156,7 +156,7 @@ func TestTriggerSystem_ForVault(t *testing.T) {
 	sub := newMinimalSub("fv-1", 55, 0)
 	ts.registry.Add(sub)
 
-	subs := ts.ForVault(55)
+	subs := ts.ForVault(testWorkspace(55))
 	if len(subs) != 1 {
 		t.Fatalf("ForVault returned %d subs, want 1", len(subs))
 	}
@@ -164,7 +164,7 @@ func TestTriggerSystem_ForVault(t *testing.T) {
 		t.Errorf("ForVault returned sub ID %q, want 'fv-1'", subs[0].ID)
 	}
 
-	empty := ts.ForVault(999)
+	empty := ts.ForVault(testWorkspace(999))
 	if len(empty) != 0 {
 		t.Errorf("ForVault on empty vault returned %d subs, want 0", len(empty))
 	}
@@ -189,7 +189,7 @@ func TestTriggerSystem_PruneExpired(t *testing.T) {
 		t.Errorf("PruneExpired returned %d, want 1", pruned)
 	}
 
-	subs := ts.ForVault(10)
+	subs := ts.ForVault(testWorkspace(10))
 	if len(subs) != 1 {
 		t.Fatalf("after prune, ForVault returned %d subs, want 1", len(subs))
 	}
@@ -220,14 +220,14 @@ func TestActiveVaults(t *testing.T) {
 		t.Fatalf("ActiveVaults returned %d vaults, want 2", len(vaults))
 	}
 
-	found := map[uint32]bool{}
+	found := map[[8]byte]bool{}
 	for _, v := range vaults {
 		found[v] = true
 	}
-	if !found[10] {
+	if !found[testWorkspace(10)] {
 		t.Error("vault 10 missing from ActiveVaults")
 	}
-	if !found[20] {
+	if !found[testWorkspace(20)] {
 		t.Error("vault 20 missing from ActiveVaults")
 	}
 }
@@ -245,28 +245,21 @@ func TestActiveVaults_AfterRemoveAll(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// vaultWS — vault workspace ID conversion
+// Full workspace routing — equal first halves remain isolated
 // ---------------------------------------------------------------------------
 
-func TestVaultWS(t *testing.T) {
+func TestFullWorkspaceRoutingSeparatesSharedPrefixes(t *testing.T) {
 	registry := newRegistry()
-	w := &TriggerWorker{registry: registry}
+	workspaceA := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	workspaceB := [8]byte{1, 2, 3, 4, 8, 7, 6, 5}
+	registry.Add(&Subscription{ID: "a", Workspace: workspaceA})
+	registry.Add(&Subscription{ID: "b", Workspace: workspaceB})
 
-	ws := w.vaultWS(0x01020304)
-	expected := [8]byte{0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0}
-	if ws != expected {
-		t.Errorf("vaultWS(0x01020304) = %v, want %v", ws, expected)
+	if got := registry.ForVault(workspaceA); len(got) != 1 || got[0].ID != "a" {
+		t.Fatalf("workspace A subscriptions = %#v, want only a", got)
 	}
-
-	ws0 := w.vaultWS(0)
-	if ws0 != [8]byte{} {
-		t.Errorf("vaultWS(0) = %v, want zero", ws0)
-	}
-
-	wsMax := w.vaultWS(0xFFFFFFFF)
-	expectedMax := [8]byte{0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0}
-	if wsMax != expectedMax {
-		t.Errorf("vaultWS(0xFFFFFFFF) = %v, want %v", wsMax, expectedMax)
+	if got := registry.ForVault(workspaceB); len(got) != 1 || got[0].ID != "b" {
+		t.Fatalf("workspace B subscriptions = %#v, want only b", got)
 	}
 }
 
@@ -293,7 +286,7 @@ func TestHandleCognitive_DeliversPush(t *testing.T) {
 	var pushCount atomic.Int32
 	sub := &Subscription{
 		ID:             "cog-sub-1",
-		VaultID:        5,
+		Workspace:      testWorkspace(5),
 		Context:        []string{"test"},
 		Threshold:      0.0,
 		DeltaThreshold: 0.0,
@@ -324,12 +317,12 @@ func TestHandleCognitive_DeliversPush(t *testing.T) {
 	}
 
 	cogCh <- CognitiveEvent{
-		VaultID:  5,
-		EngramID: engID,
-		Field:    "relevance",
-		OldValue: 0.3,
-		NewValue: 0.8,
-		Delta:    0.5,
+		Workspace: testWorkspace(5),
+		EngramID:  engID,
+		Field:     "relevance",
+		OldValue:  0.3,
+		NewValue:  0.8,
+		Delta:     0.5,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -365,12 +358,12 @@ func TestHandleCognitive_NoSubsNoOp(t *testing.T) {
 
 	// No subs for vault 99 — handleCognitive should return early.
 	worker.handleCognitive(context.Background(), CognitiveEvent{
-		VaultID:  99,
-		EngramID: storage.NewULID(),
-		Field:    "relevance",
-		OldValue: 0.1,
-		NewValue: 0.9,
-		Delta:    0.8,
+		Workspace: testWorkspace(99),
+		EngramID:  storage.NewULID(),
+		Field:     "relevance",
+		OldValue:  0.1,
+		NewValue:  0.9,
+		Delta:     0.8,
 	})
 }
 
@@ -381,12 +374,12 @@ func TestHandleCognitive_StoreErrorNoOp(t *testing.T) {
 
 	var pushCount atomic.Int32
 	sub := &Subscription{
-		ID:          "cog-err-sub",
-		VaultID:     5,
-		Threshold:   0.0,
-		Deliver:     func(_ context.Context, _ *ActivationPush) error { pushCount.Add(1); return nil },
+		ID:           "cog-err-sub",
+		Workspace:    testWorkspace(5),
+		Threshold:    0.0,
+		Deliver:      func(_ context.Context, _ *ActivationPush) error { pushCount.Add(1); return nil },
 		pushedScores: make(map[storage.ULID]float64),
-		rateLimiter: newTokenBucket(100),
+		rateLimiter:  newTokenBucket(100),
 	}
 	registry.Add(sub)
 
@@ -402,9 +395,9 @@ func TestHandleCognitive_StoreErrorNoOp(t *testing.T) {
 
 	// Engram ID not in store → GetMetadata returns empty → early return.
 	worker.handleCognitive(context.Background(), CognitiveEvent{
-		VaultID:  5,
-		EngramID: storage.NewULID(),
-		Delta:    0.5,
+		Workspace: testWorkspace(5),
+		EngramID:  storage.NewULID(),
+		Delta:     0.5,
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -431,7 +424,7 @@ func TestHandleCognitive_DeltaThresholdSuppresses(t *testing.T) {
 	var pushCount atomic.Int32
 	sub := &Subscription{
 		ID:             "cog-delta-sub",
-		VaultID:        5,
+		Workspace:      testWorkspace(5),
 		Threshold:      0.0,
 		DeltaThreshold: 0.99, // very high delta threshold
 		Deliver:        func(_ context.Context, _ *ActivationPush) error { pushCount.Add(1); return nil },
@@ -451,12 +444,12 @@ func TestHandleCognitive_DeltaThresholdSuppresses(t *testing.T) {
 	}
 
 	worker.handleCognitive(context.Background(), CognitiveEvent{
-		VaultID:  5,
-		EngramID: engID,
-		Field:    "relevance",
-		OldValue: 0.79,
-		NewValue: 0.81,
-		Delta:    0.02,
+		Workspace: testWorkspace(5),
+		EngramID:  engID,
+		Field:     "relevance",
+		OldValue:  0.79,
+		NewValue:  0.81,
+		Delta:     0.02,
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -481,7 +474,7 @@ func TestHandleCognitive_ClearsScoreWhenBelowThreshold(t *testing.T) {
 
 	sub := &Subscription{
 		ID:             "cog-clear-sub",
-		VaultID:        5,
+		Workspace:      testWorkspace(5),
 		Threshold:      0.99, // very high threshold → score won't pass
 		DeltaThreshold: 0.0,
 		Deliver:        func(_ context.Context, _ *ActivationPush) error { return nil },
@@ -501,12 +494,12 @@ func TestHandleCognitive_ClearsScoreWhenBelowThreshold(t *testing.T) {
 	}
 
 	worker.handleCognitive(context.Background(), CognitiveEvent{
-		VaultID:  5,
-		EngramID: engID,
-		Field:    "confidence",
-		OldValue: 0.8,
-		NewValue: 0.01,
-		Delta:    0.79,
+		Workspace: testWorkspace(5),
+		EngramID:  engID,
+		Field:     "confidence",
+		OldValue:  0.8,
+		NewValue:  0.01,
+		Delta:     0.79,
 	})
 
 	sub.mu.Lock()
@@ -562,7 +555,7 @@ func TestHandleSweep_WithHNSW(t *testing.T) {
 	testVec := []float32{0.5, 0.5, 0.5, 0.5}
 	sub := &Subscription{
 		ID:             "sweep-sub",
-		VaultID:        8,
+		Workspace:      testWorkspace(8),
 		Context:        []string{"sweep context"},
 		Threshold:      0.0,
 		DeltaThreshold: 0.0,
@@ -646,7 +639,7 @@ func TestSweepVault_NoEmbedding_UsesEmbedder(t *testing.T) {
 	var pushCount atomic.Int32
 	sub := &Subscription{
 		ID:             "sweep-embed-sub",
-		VaultID:        9,
+		Workspace:      testWorkspace(9),
 		Context:        []string{"needs embedding"},
 		Threshold:      0.0,
 		DeltaThreshold: 0.0,
@@ -672,9 +665,9 @@ func TestSweepVault_NoEmbedding_UsesEmbedder(t *testing.T) {
 		contraEvents: make(chan ContradictEvent, 1),
 	}
 
-	ws := worker.vaultWS(9)
-	subs := registry.ForVault(9)
-	worker.sweepVault(context.Background(), 9, ws, subs)
+	ws := testWorkspace(9)
+	subs := registry.ForVault(testWorkspace(9))
+	worker.sweepWorkspace(context.Background(), ws, subs)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -714,7 +707,7 @@ func TestSweepVault_SkipsSoftDeleted(t *testing.T) {
 	var pushCount atomic.Int32
 	sub := &Subscription{
 		ID:             "sweep-del-sub",
-		VaultID:        11,
+		Workspace:      testWorkspace(11),
 		Context:        []string{"ctx"},
 		Threshold:      0.0,
 		DeltaThreshold: 0.0,
@@ -739,9 +732,9 @@ func TestSweepVault_SkipsSoftDeleted(t *testing.T) {
 		contraEvents: make(chan ContradictEvent, 1),
 	}
 
-	ws := worker.vaultWS(11)
-	subs := registry.ForVault(11)
-	worker.sweepVault(context.Background(), 11, ws, subs)
+	ws := testWorkspace(11)
+	subs := registry.ForVault(testWorkspace(11))
+	worker.sweepWorkspace(context.Background(), ws, subs)
 
 	time.Sleep(50 * time.Millisecond)
 	if pushCount.Load() != 0 {

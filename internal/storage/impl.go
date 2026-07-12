@@ -49,11 +49,11 @@ type PebbleStore struct {
 	// Invalidated on any WriteAssociation or UpdateAssociation for that engram.
 	// Bounded to 500_000 entries with 2s TTL; expirable.LRU handles expiry automatically.
 	assocCache *expirable.LRU[[24]byte, *assocCacheEntry]
-	// metaCache: [16]byte (engramID) → *EngramMeta
+	// metaCache: [24]byte (wsPrefix[8]+engramID[16]) → *EngramMeta
 	// Caches metadata for hot read-path engrams so GetMetadata never goes to Pebble twice.
 	// Populated by GetMetadata on first Pebble read. Invalidated by UpdateMetadata/WriteEngram.
 	// Bounded to 100_000 entries.
-	metaCache *lru.Cache[[16]byte, *EngramMeta]
+	metaCache *lru.Cache[[24]byte, *EngramMeta]
 	// vaultPrefixCache: vault name (string) → [8]byte workspace prefix
 	// Eliminates the Pebble.Get in ResolveVaultPrefix on every write/activation.
 	// Bounded to 10_000 entries.
@@ -68,7 +68,7 @@ type PebbleStore struct {
 	// All transition reads/writes go through this layer; Pebble is only hit on
 	// cold-start loads and periodic flushes.
 	transCache *TransitionCache
-	closeOnce   sync.Once
+	closeOnce  sync.Once
 	// entityLocks and coOccurrenceLocks use fixed-size striped mutex arrays instead of
 	// sync.Map to bound memory growth. sync.Map grows unbounded (one entry per unique key
 	// ever seen); stripedMutex uses a constant 256 × sizeof(sync.Mutex) ≈ 6 KB.
@@ -171,7 +171,7 @@ func (ps *PebbleStore) GetVaultCount(ctx context.Context, wsPrefix [8]byte) int6
 // NewPebbleStore creates a new PebbleStore wrapping a Pebble database and L1 cache.
 func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 	prov := provenance.NewStore(db)
-	metaCache, _ := lru.New[[16]byte, *EngramMeta](100_000)
+	metaCache, _ := lru.New[[24]byte, *EngramMeta](100_000)
 	vaultPrefixCache, _ := lru.New[string, [8]byte](10_000)
 	assocCache := expirable.NewLRU[[24]byte, *assocCacheEntry](500_000, nil, 2*time.Second)
 	ps := &PebbleStore{
@@ -189,6 +189,16 @@ func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 	ps.transCache = NewTransitionCache(ps)
 	ps.archiveBloom = ps.RebuildArchiveBloom()
 	return ps
+}
+
+// metaCacheKey scopes metadata cache entries to the full vault workspace.
+// Engram ULIDs are not guaranteed to be globally unique when data is imported,
+// so an ID-only cache key can return another vault's metadata.
+func metaCacheKey(wsPrefix [8]byte, id ULID) [24]byte {
+	var key [24]byte
+	copy(key[:8], wsPrefix[:])
+	copy(key[8:], id[:])
+	return key
 }
 
 // CacheLen returns the number of entries in the L1 cache.
@@ -311,7 +321,10 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 		return ULID{}, fmt.Errorf("commit batch: %w", err)
 	}
 
-	// NOTE: Intentionally NOT caching on write to avoid flooding L1 cache.
+	// Do not populate caches on write, and evict any existing entry in case an
+	// import intentionally supplied an already-present ULID.
+	ps.cache.Delete(wsPrefix, eng.ID)
+	ps.metaCache.Remove(metaCacheKey(wsPrefix, eng.ID))
 
 	// Vault counter: in-memory atomic; coalescer persists every 100ms.
 	// Load-or-init before the Add so we hold a reference to the live counter.
@@ -483,6 +496,10 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		}
 		eng := items[i].Engram
 		ws := items[i].WSPrefix
+		// Do not populate caches on write, and evict any existing entry in case
+		// an import intentionally supplied an already-present ULID.
+		ps.cache.Delete(ws, eng.ID)
+		ps.metaCache.Remove(metaCacheKey(ws, eng.ID))
 
 		vc := ps.getOrInitCounter(ctx, ws)
 		newCount := vc.count.Add(1)

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestCacheGetSetDelete(t *testing.T) {
@@ -129,6 +130,30 @@ func TestLastAccessNs(t *testing.T) {
 	}
 }
 
+func TestCachePeekDoesNotAdvanceLastAccess(t *testing.T) {
+	c := NewL1Cache(100)
+	id := NewULID()
+	var pfx [8]byte
+	eng := &Engram{ID: id, Concept: "peek-test", Content: "body", Confidence: 1.0, Stability: 30}
+	c.Set(pfx, id, eng)
+	before := c.LastAccessNs(pfx, id)
+
+	time.Sleep(time.Millisecond)
+	if _, ok := c.Peek(pfx, id); !ok {
+		t.Fatal("expected cache hit from Peek")
+	}
+	if afterPeek := c.LastAccessNs(pfx, id); afterPeek != before {
+		t.Fatalf("Peek advanced last access: got %d want %d", afterPeek, before)
+	}
+
+	if _, ok := c.Get(pfx, id); !ok {
+		t.Fatal("expected cache hit from Get")
+	}
+	if afterGet := c.LastAccessNs(pfx, id); afterGet <= before {
+		t.Fatalf("Get did not advance last access: got %d want > %d", afterGet, before)
+	}
+}
+
 // TestEngramLastAccessNs verifies EngramLastAccessNs returns 0 when an engram
 // is not in the L1 cache and a positive value after GetEngram populates the cache.
 func TestEngramLastAccessNs(t *testing.T) {
@@ -149,7 +174,16 @@ func TestEngramLastAccessNs(t *testing.T) {
 		t.Errorf("EngramLastAccessNs before GetEngram: got %d, want 0", ns)
 	}
 
-	// GetEngram populates the L1 cache.
+	// A passive cache miss must not populate the L1 cache.
+	passiveCtx := ContextWithPassiveReads(ctx)
+	if _, err := store.GetEngram(passiveCtx, ws, id); err != nil {
+		t.Fatalf("passive GetEngram: %v", err)
+	}
+	if ns := store.EngramLastAccessNs(ws, id); ns != 0 {
+		t.Fatalf("EngramLastAccessNs after passive cache miss: got %d want 0", ns)
+	}
+
+	// A normal GetEngram populates the L1 cache.
 	if _, err := store.GetEngram(ctx, ws, id); err != nil {
 		t.Fatalf("GetEngram: %v", err)
 	}
@@ -157,5 +191,15 @@ func TestEngramLastAccessNs(t *testing.T) {
 	// Now the cache entry exists — expect > 0.
 	if ns := store.EngramLastAccessNs(ws, id); ns <= 0 {
 		t.Errorf("EngramLastAccessNs after GetEngram: got %d, want > 0", ns)
+	}
+
+	// A passive cache hit returns the engram without advancing the timestamp.
+	beforePassiveHit := store.EngramLastAccessNs(ws, id)
+	time.Sleep(time.Millisecond)
+	if _, err := store.GetEngram(passiveCtx, ws, id); err != nil {
+		t.Fatalf("passive cached GetEngram: %v", err)
+	}
+	if afterPassiveHit := store.EngramLastAccessNs(ws, id); afterPassiveHit != beforePassiveHit {
+		t.Fatalf("passive cache hit advanced last access: got %d want %d", afterPassiveHit, beforePassiveHit)
 	}
 }

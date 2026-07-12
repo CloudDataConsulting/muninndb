@@ -54,6 +54,17 @@ func (c *L1Cache) Get(ws [8]byte, id ULID) (*Engram, bool) {
 	return entry.eng, true
 }
 
+// Peek retrieves an engram without advancing its cognitive last-access time.
+// It is used by observe-mode reads, which may inspect but must not train future
+// recency or decay scoring.
+func (c *L1Cache) Peek(ws [8]byte, id ULID) (*Engram, bool) {
+	val, ok := c.data.Load(cacheKeyFor(ws, id))
+	if !ok {
+		return nil, false
+	}
+	return val.(*cacheEntry).eng, true
+}
+
 // Set stores an engram in the cache under the given vault prefix.
 func (c *L1Cache) Set(ws [8]byte, id ULID, eng *Engram) {
 	entry := &cacheEntry{

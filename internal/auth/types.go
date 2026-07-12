@@ -1,6 +1,9 @@
 package auth
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type AdminUser struct {
 	Username  string    `json:"username"`
@@ -12,15 +15,15 @@ type APIKey struct {
 	ID          string     `json:"id"`
 	Vault       string     `json:"vault"`
 	Label       string     `json:"label"`
-	Mode        string     `json:"mode"`      // "full", "observe", or "write" (ingest-only)
+	Mode        string     `json:"mode"` // "full", "observe", or "write" (ingest-only)
 	CreatedAt   time.Time  `json:"created_at"`
 	StorageHash []byte     `json:"storage_hash"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"` // nil = never expires
 }
 
 type VaultConfig struct {
-	Name       string           `json:"name"`
-	Public     bool             `json:"public"`
+	Name       string            `json:"name"`
+	Public     bool              `json:"public"`
 	Plasticity *PlasticityConfig `json:"plasticity,omitempty"` // per-vault cognitive pipeline config
 }
 
@@ -33,8 +36,22 @@ const (
 
 type contextKey string
 
+type PrincipalKind string
+
 const (
-	ContextVault  contextKey = "auth_vault"
-	ContextMode   contextKey = "auth_mode"
-	ContextAPIKey contextKey = "auth_apikey"
+	PrincipalAPIKey PrincipalKind = "api_key"
+	PrincipalPublic PrincipalKind = "public"
+	PrincipalAdmin  PrincipalKind = "admin"
 )
+
+const (
+	ContextVault     contextKey = "auth_vault"
+	ContextMode      contextKey = "auth_mode"
+	ContextAPIKey    contextKey = "auth_apikey"
+	ContextPrincipal contextKey = "auth_principal"
+)
+
+func PrincipalFromContext(ctx context.Context) PrincipalKind {
+	principal, _ := ctx.Value(ContextPrincipal).(PrincipalKind)
+	return principal
+}

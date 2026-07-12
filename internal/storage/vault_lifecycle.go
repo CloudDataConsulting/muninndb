@@ -95,11 +95,12 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 		}
 	}
 
-	// metaCache: keys are [16]byte (engramID only — not vault-scoped).
-	// We cannot filter by vault, so clear all entries. The cache is a
-	// read-through; evicting unrelated vaults only costs one extra Pebble read
-	// per metadata access, which is acceptable.
-	ps.metaCache.Purge()
+	// metaCache: keys are [24]byte = ws[8] + engramID[16].
+	for _, k := range ps.metaCache.Keys() {
+		if [8]byte(k[:8]) == ws {
+			ps.metaCache.Remove(k)
+		}
+	}
 
 	// recentActiveCache: keys are [8]byte (wsPrefix).
 	ps.recentActiveCache.Delete(ws)

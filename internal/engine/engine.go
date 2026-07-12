@@ -366,8 +366,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 	// so it is set before the goroutine starts.
 	if e.hebbianWorker != nil && e.triggers != nil {
 		e.hebbianWorker.OnWeightUpdate = func(ws [8]byte, id [16]byte, field string, old, new float64) {
-			vaultID := wsVaultID(ws)
-			e.triggers.NotifyCognitive(vaultID, storage.ULID(id), field, float32(old), float32(new))
+			e.triggers.NotifyCognitive(ws, storage.ULID(id), field, float32(old), float32(new))
 		}
 	}
 	// Fix 5: Load persisted coherence counters for known vaults.
@@ -667,10 +666,17 @@ func (e *Engine) Store() *storage.PebbleStore {
 	return e.store
 }
 
+func observeReadContext(ctx context.Context) context.Context {
+	if auth.ObserveFromContext(ctx) {
+		return storage.ContextWithPassiveReads(ctx)
+	}
+	return ctx
+}
+
 // GetEngram fetches a single engram by vault and ULID.
 func (e *Engine) GetEngram(ctx context.Context, vault string, id storage.ULID) (*storage.Engram, error) {
 	wsPrefix := e.store.ResolveVaultPrefix(vault)
-	return e.store.GetEngram(ctx, wsPrefix, id)
+	return e.store.GetEngram(observeReadContext(ctx), wsPrefix, id)
 }
 
 // UpdateTags replaces the tags on an engram.
@@ -948,7 +954,7 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 			Associations: contraAssocs,
 			OnFound: func(ev cognitive.ContradictionEvent) {
 				if e.triggers != nil {
-					e.triggers.NotifyContradiction(wsVaultID(wsPrefix), storage.ULID(ev.EngramA), storage.ULID(ev.EngramB), ev.Severity, "semantic")
+					e.triggers.NotifyContradiction(wsPrefix, storage.ULID(ev.EngramA), storage.ULID(ev.EngramB), ev.Severity, "semantic")
 				}
 				_, _, cw := e.cogWorkers()
 				if cw != nil {
@@ -1031,14 +1037,13 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	// to the struct after Write() returns and the caller's stack frame is potentially
 	// reused. A shallow copy is safe because the trigger worker never mutates fields.
 	if e.triggers != nil {
-		vaultID := wsVaultID(wsPrefix)
 		engCopy := *eng // struct copy; deep-copy slices so trigger worker has independent data
 		engCopy.Tags = append([]string(nil), eng.Tags...)
 		engCopy.Associations = append([]storage.Association(nil), eng.Associations...)
 		if eng.Embedding != nil {
 			engCopy.Embedding = append([]float32(nil), eng.Embedding...)
 		}
-		e.triggers.NotifyWrite(vaultID, &engCopy, true)
+		e.triggers.NotifyWrite(wsPrefix, &engCopy, true)
 	}
 
 	// Notify background processors (e.g. embed worker) of the new engram.
@@ -1336,7 +1341,7 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 				Associations: contraAssocs,
 				OnFound: func(ev cognitive.ContradictionEvent) {
 					if e.triggers != nil {
-						e.triggers.NotifyContradiction(wsVaultID(wsPrefix), storage.ULID(ev.EngramA), storage.ULID(ev.EngramB), ev.Severity, "semantic")
+						e.triggers.NotifyContradiction(wsPrefix, storage.ULID(ev.EngramA), storage.ULID(ev.EngramB), ev.Severity, "semantic")
 					}
 					_, _, cw := e.cogWorkers()
 					if cw != nil {
@@ -1398,14 +1403,13 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		}
 
 		if e.triggers != nil {
-			vaultID := wsVaultID(p.wsPrefix)
 			engCopy := *p.eng
 			engCopy.Tags = append([]string(nil), p.eng.Tags...)
 			engCopy.Associations = append([]storage.Association(nil), p.eng.Associations...)
 			if p.eng.Embedding != nil {
 				engCopy.Embedding = append([]float32(nil), p.eng.Embedding...)
 			}
-			e.triggers.NotifyWrite(vaultID, &engCopy, true)
+			e.triggers.NotifyWrite(p.wsPrefix, &engCopy, true)
 		}
 
 		if fn, ok := e.onWrite.Load().(func()); ok && fn != nil {
@@ -1422,6 +1426,8 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error) {
 	readStart := time.Now()
 	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+	observe := auth.ObserveFromContext(ctx)
+	ctx = observeReadContext(ctx)
 
 	id, err := storage.ParseULID(req.ID)
 	if err != nil {
@@ -1437,16 +1443,19 @@ func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadRespo
 	}
 
 	// Fire implicit positive feedback signal asynchronously — read = accessed.
+	// Observe-mode reads must not alter learned scoring weights.
 	// spawnFireAndForget ensures Stop() drains this goroutine before DB close.
-	e.spawnFireAndForget(func() {
-		signal := scoring.FeedbackSignal{
-			EngramID:    [16]byte(id),
-			Accessed:    true,
-			ScoreVector: scoring.DefaultWeights(),
-			Timestamp:   time.Now(),
-		}
-		e.scoring.RecordFeedback(e.stopCtx, wsPrefix, signal)
-	})
+	if !observe {
+		e.spawnFireAndForget(func() {
+			signal := scoring.FeedbackSignal{
+				EngramID:    [16]byte(id),
+				Accessed:    true,
+				ScoreVector: scoring.DefaultWeights(),
+				Timestamp:   time.Now(),
+			}
+			e.scoring.RecordFeedback(e.stopCtx, wsPrefix, signal)
+		})
+	}
 
 	// Collect entities linked to this engram (0x20 forward index).
 	var entities []mbp.InlineEntity
@@ -1521,6 +1530,8 @@ func (e *Engine) ActivateWithStructuredFilter(ctx context.Context, req *mbp.Acti
 // activateCore is the shared implementation for Activate and ActivateWithStructuredFilter.
 // structuredFilter may be nil (plain Activate) or a typed predicate (structured query).
 func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, structuredFilter activation.EngramFilter) (*mbp.ActivateResponse, error) {
+	observe := auth.ObserveFromContext(ctx)
+	ctx = observeReadContext(ctx)
 	// Pin a Pebble snapshot so all read phases see a consistent point-in-time view.
 	snap := e.store.NewSnapshot()
 	defer snap.Close()
@@ -1544,7 +1555,9 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 
 	// Build activation.ActivateRequest
 	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
-	e.activity.Record(wsPrefix)
+	if !observe {
+		e.activity.Record(wsPrefix)
+	}
 	vaultSize := e.store.GetVaultCount(ctx, wsPrefix)
 	vaultID := wsVaultID(wsPrefix)
 	actReq := &activation.ActivateRequest{
@@ -1585,7 +1598,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	}
 
 	// Fix 4: Observe mode is a pure read — skip activation log side effects.
-	actReq.ReadOnly = auth.ObserveFromContext(ctx)
+	actReq.ReadOnly = observe
 
 	// Convert weights if provided; otherwise apply preset weights from Plasticity config.
 	// All scoring goes through ACT-R; legacy temporal path is kept in code but not reachable for now.
@@ -1688,7 +1701,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// The activation log is updated asynchronously by Run()'s drainLog goroutine,
 	// so capturing it here guarantees we see the correct "previous" entry.
 	var prevActivation []storage.ULID
-	if resolved.PredictiveActivation && !auth.ObserveFromContext(ctx) {
+	if resolved.PredictiveActivation && !observe {
 		prevEntries := e.activation.AssocLog().RecentForVault(vaultID, 1)
 		if len(prevEntries) > 0 {
 			prevActivation = prevEntries[0].EngramIDs
@@ -1777,7 +1790,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// Submit co-activations to Hebbian worker (skipped in observe mode or when disabled by Plasticity).
 	// On Lobe nodes (hebbianWorker == nil) collect refs for forwarding to Cortex instead.
 	var lobeCoActivations []mbp.CoActivationRef
-	if len(result.Activations) > 0 && !auth.ObserveFromContext(ctx) && resolved.HebbianEnabled {
+	if len(result.Activations) > 0 && !observe && resolved.HebbianEnabled {
 		hebW, _, _ := e.cogWorkers()
 		if hebW != nil {
 			coActivatedEngrams := make([]cognitive.CoActivatedEngram, len(result.Activations))
@@ -1806,7 +1819,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// PAS: Record sequential transitions (previous activation → current activation).
 	// Uses the prevActivation snapshot captured before Run() to avoid race conditions
 	// with the async drainLog goroutine.
-	if len(result.Activations) > 0 && len(prevActivation) > 0 {
+	if !observe && len(result.Activations) > 0 && len(prevActivation) > 0 {
 		e.cogMu.RLock()
 		tw := e.transitionWorker
 		e.cogMu.RUnlock()
@@ -1837,7 +1850,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// from archive during Phase 4.75. ArchivedEdges are not forwarded — the Cortex
 	// runs its own decay pass and archives edges independently.
 	restoredEdges := result.RestoredEdges
-	if e.coordinator != nil && (len(lobeCoActivations) > 0 || len(restoredEdges) > 0) {
+	if !observe && e.coordinator != nil && (len(lobeCoActivations) > 0 || len(restoredEdges) > 0) {
 		effect := mbp.CognitiveSideEffect{
 			QueryID:       e.fastQueryID(),
 			OriginNodeID:  e.coordinatorID,
@@ -1921,17 +1934,30 @@ func (e *Engine) SubscribeWithDeliver(ctx context.Context, req *mbp.SubscribeReq
 	if subID == "" {
 		subID = uuid.New().String()
 	}
+	vault := req.Vault
+	if authenticatedVault, ok := ctx.Value(auth.ContextVault).(string); ok && authenticatedVault != "" {
+		if vault != "" && vault != authenticatedVault {
+			return "", fmt.Errorf("subscribe: requested vault %q does not match authenticated vault %q", vault, authenticatedVault)
+		}
+		vault = authenticatedVault
+	}
+	if vault == "" {
+		vault = "default"
+	}
 
-	// Resolve vault to a routing uint32 using the same BigEndian convention
-	// already used in storage/impl.go (binary.BigEndian.Uint32(wsPrefix[:4])).
-	// This is a compact routing key; the full 8-byte prefix is preserved in the
-	// workspace prefix used for storage lookups.
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
-	vaultID := wsVaultID(wsPrefix)
+	// Preserve the complete vault workspace for trigger routing. Truncating this
+	// SipHash-derived key to uint32 can collide and cannot reconstruct the storage
+	// prefix used by background subscription reads.
+	wsPrefix := e.store.ResolveVaultPrefix(vault)
+	passiveReads := auth.ObserveFromContext(ctx)
+	requestContext := context.WithoutCancel(ctx)
+	if passiveReads {
+		requestContext = storage.ContextWithPassiveReads(requestContext)
+	}
 
 	sub := &trigger.Subscription{
 		ID:             subID,
-		VaultID:        vaultID,
+		Workspace:      wsPrefix,
 		Context:        req.Context,
 		Threshold:      float64(req.Threshold),
 		TTL:            time.Duration(req.TTL) * time.Second,
@@ -1939,6 +1965,8 @@ func (e *Engine) SubscribeWithDeliver(ctx context.Context, req *mbp.SubscribeReq
 		PushOnWrite:    req.PushOnWrite,
 		DeltaThreshold: float64(req.DeltaThreshold),
 		Deliver:        deliver,
+		RequestContext: requestContext,
+		PassiveReads:   passiveReads,
 	}
 
 	if err := e.triggers.Subscribe(sub); err != nil {
@@ -2019,7 +2047,7 @@ func (e *Engine) Link(ctx context.Context, req *mbp.LinkRequest) (*mbp.LinkRespo
 				},
 				OnFound: func(ev cognitive.ContradictionEvent) {
 					if e.triggers != nil {
-						e.triggers.NotifyContradiction(wsVaultID(wsPrefix), storage.ULID(ev.EngramA), storage.ULID(ev.EngramB), ev.Severity, "explicit_link")
+						e.triggers.NotifyContradiction(wsPrefix, storage.ULID(ev.EngramA), storage.ULID(ev.EngramB), ev.Severity, "explicit_link")
 					}
 					_, _, cw := e.cogWorkers()
 					if cw != nil {
@@ -2188,8 +2216,7 @@ func (e *Engine) SetCognitiveWorkers(
 	// concurrent goroutines never see a worker without its callback.
 	if heb != nil && e.triggers != nil {
 		heb.OnWeightUpdate = func(ws [8]byte, id [16]byte, field string, old, new float64) {
-			vaultID := wsVaultID(ws)
-			e.triggers.NotifyCognitive(vaultID, storage.ULID(id), field, float32(old), float32(new))
+			e.triggers.NotifyCognitive(ws, storage.ULID(id), field, float32(old), float32(new))
 		}
 	}
 	e.hebbianWorker = heb
@@ -2306,6 +2333,7 @@ func (e *Engine) UpdateLifecycleState(ctx context.Context, vault, id, state stri
 
 // ListDeleted returns soft-deleted engrams in the vault, up to limit.
 func (e *Engine) ListDeleted(ctx context.Context, vault string, limit int) ([]*storage.Engram, error) {
+	ctx = observeReadContext(ctx)
 	ws := e.store.ResolveVaultPrefix(vault)
 	ids, err := e.store.ListByState(ctx, ws, storage.StateSoftDeleted, limit)
 	if err != nil {
@@ -2964,4 +2992,3 @@ func (e *Engine) RecordFeedback(ctx context.Context, vault, engramID string, use
 	})
 	return nil
 }
-

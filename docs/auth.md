@@ -48,6 +48,8 @@ Admin credentials authenticate to:
 
 A vault is either **open** (no API key required) or **locked** (API key required). The built-in `default` vault ships **open** out of the box so that any MCP client can connect without configuration. Additional vaults you create start locked and must be explicitly opened.
 
+Open vault REST requests run in `full` mode unless a caller presents a different API key. Use an `observe` key when you need read access without cognitive-state writes.
+
 A vault can have multiple API keys — one per integration point. You might have:
 
 ```
@@ -62,9 +64,10 @@ vault: default
 | Mode | Reads | Cognitive state writes | Use case |
 |------|-------|------------------------|----------|
 | `full` | Yes | **Yes** — temporal scores refresh, Hebbian weights update, access counts increment | AI agents, primary integrations, anything that is *part of* the brain |
-| `observe` | Yes | **No** — scores are computed but nothing is persisted | Dashboards, analytics, read-only partners, exports |
+| `observe` | Yes | **No** — mutating REST routes return `403` before the engine is reached; engine-layer cognitive mutations are also suppressed | Dashboards, analytics, read-only partners, exports |
+| `write` | **No** — read and data-returning mutation routes return `403` | **Explicit writes only** — ingest-only mutations that do not return vault data remain available | Ingestion pipelines that must not read vault contents |
 
-The `observe` mode exists because the vault's cognitive state is the thing of value. A dashboard reading engrams 1000 times a day should not inflate access counts and distort what the AI agent sees as relevant. `observe` keys see the brain; they don't affect it.
+The `observe` mode exists because the vault's cognitive state is the thing of value. A dashboard reading engrams 1000 times a day should not inflate access counts and distort what the AI agent sees as relevant. `observe` keys see the brain; they don't affect it, and semantically mutating REST routes are rejected.
 
 ### Key format
 
@@ -253,23 +256,34 @@ If each user had their own relevance weights, the vault would have N brains inst
 | Admin passwords | bcrypt with default cost |
 | Session tokens | HMAC-SHA256 signed, 24h TTL, HttpOnly cookie |
 | Transport | HTTP by default; run behind TLS-terminating proxy in production |
-| Key revocation | Immediate, no grace period |
-| Observe isolation | Enforced in engine activation layer — not just an honor system |
+| Key revocation | REST enforces revocation on the next authenticated request and before each SSE delivery; idle REST SSE streams recheck within 1 second. MBP and gRPC retain their transport-specific behavior until the coordinated authorization drafts land. |
+| Observe isolation | Enforced at both the REST transport layer (`ReadOnlyGuard`) and the engine activation layer — not just an honor system |
 | Encryption at rest | Not built-in — use OS/volume encryption; see [self-hosting guide](self-hosting.md#encryption-at-rest) |
 
 ---
 
 ## Migration from unauthenticated installations
 
-Existing vaults default to `public: true`. Nothing breaks. You add auth incrementally:
+Vault policy is fail-closed. When an installation has no persisted vault
+configuration at all, bootstrap creates only the `default` vault as public. It
+does not automatically make every existing named vault public; any vault without
+an explicit config requires a key. Existing explicit configs are preserved
+unchanged during upgrade.
 
-1. Admin user is created on first run with the new binary
-2. All existing vaults continue to work without keys
-3. Lock specific vaults by setting `public: false` via the admin API
-4. Generate keys for your integrations
-5. Update your integrations to include `Authorization: Bearer mk_...`
+To migrate deliberately:
 
-You can lock vaults one at a time while rolling out keys to your services.
+1. Inventory the existing vault names and their persisted configs.
+2. Explicitly configure every existing vault via the admin API. Set
+   `public: true` only where temporary unauthenticated compatibility is intended;
+   otherwise set `public: false`.
+3. Generate keys for integrations that use locked vaults.
+4. Update those integrations to include `Authorization: Bearer mk_...`.
+5. After verifying key-based access, lock any vaults that were left public only
+   for the migration window.
+
+Until step 2 is complete, existing non-default or otherwise unconfigured vaults
+reject anonymous access. This behavior prevents an upgrade from accidentally
+exposing a previously named vault.
 
 ---
 

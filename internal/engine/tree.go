@@ -326,10 +326,9 @@ func (e *Engine) AddChild(ctx context.Context, vault, parentID string, input *Ad
 	}
 
 	if e.triggers != nil {
-		vaultID := wsVaultID(ws)
 		childCopy := *child
 		childCopy.Tags = append([]string(nil), child.Tags...)
-		e.triggers.NotifyWrite(vaultID, &childCopy, true)
+		e.triggers.NotifyWrite(ws, &childCopy, true)
 	}
 
 	if fn, ok := e.onWrite.Load().(func()); ok && fn != nil {

@@ -117,6 +117,7 @@ const entityHopWeight = 0.1
 // are looked up, and every other engram in the same vault that also mentions
 // those entities is enqueued at depth d+1 (with entityHopWeight).
 func (e *Engine) Traverse(ctx context.Context, vault, startID string, maxHops, maxNodes int, followEntities bool) ([]TraversalNode, []TraversalEdge, error) {
+	ctx = observeReadContext(ctx)
 	ws := e.store.ResolveVaultPrefix(vault)
 	start, err := storage.ParseULID(startID)
 	if err != nil {

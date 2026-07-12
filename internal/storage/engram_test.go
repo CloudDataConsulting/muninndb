@@ -516,3 +516,74 @@ func TestGetMetadata_ReturnNilForMissing(t *testing.T) {
 		t.Errorf("slot 2 (missingID): expected nil, got %+v", metas[2])
 	}
 }
+
+// TestGetMetadataCacheIsVaultScoped verifies that identical imported ULIDs in
+// different vaults cannot share a metadata cache entry.
+func TestGetMetadataCacheIsVaultScoped(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	workspaceA := store.VaultPrefix("metadata-cache-a")
+	workspaceB := store.VaultPrefix("metadata-cache-b")
+	id := NewULID()
+
+	engramA := &Engram{ID: id, Concept: "vault A", Content: "low confidence", Confidence: 0.25, Relevance: 0.2}
+	engramB := &Engram{ID: id, Concept: "vault B", Content: "high confidence", Confidence: 0.9, Relevance: 0.8}
+	if _, err := store.WriteEngram(ctx, workspaceA, engramA); err != nil {
+		t.Fatalf("WriteEngram(workspaceA): %v", err)
+	}
+	if _, err := store.WriteEngram(ctx, workspaceB, engramB); err != nil {
+		t.Fatalf("WriteEngram(workspaceB): %v", err)
+	}
+
+	metasA, err := store.GetMetadata(ctx, workspaceA, []ULID{id})
+	if err != nil || len(metasA) != 1 || metasA[0] == nil {
+		t.Fatalf("GetMetadata(workspaceA) = %v, %v", metasA, err)
+	}
+	metasB, err := store.GetMetadata(ctx, workspaceB, []ULID{id})
+	if err != nil || len(metasB) != 1 || metasB[0] == nil {
+		t.Fatalf("GetMetadata(workspaceB) = %v, %v", metasB, err)
+	}
+
+	if got := metasA[0].Confidence; got != engramA.Confidence {
+		t.Fatalf("workspace A confidence=%v, want %v", got, engramA.Confidence)
+	}
+	if got := metasB[0].Confidence; got != engramB.Confidence {
+		t.Fatalf("workspace B confidence=%v, want %v; metadata cache crossed vaults", got, engramB.Confidence)
+	}
+	if metasA[0] == metasB[0] {
+		t.Fatal("different vaults returned the same metadata cache object")
+	}
+
+	overwriteB := &Engram{ID: id, Concept: "vault B overwrite", Content: "new metadata", Confidence: 0.55, Relevance: 0.45}
+	if _, err := store.WriteEngram(ctx, workspaceB, overwriteB); err != nil {
+		t.Fatalf("WriteEngram(overwrite workspaceB): %v", err)
+	}
+	metasB, err = store.GetMetadata(ctx, workspaceB, []ULID{id})
+	if err != nil || len(metasB) != 1 || metasB[0] == nil || metasB[0].Confidence != overwriteB.Confidence {
+		t.Fatalf("GetMetadata(workspaceB after overwrite) = %v, %v", metasB, err)
+	}
+
+	overwriteA := &Engram{ID: id, Concept: "vault A batch overwrite", Content: "new batch metadata", Confidence: 0.65, Relevance: 0.6}
+	batch := store.NewBatch()
+	defer batch.Discard()
+	if err := batch.WriteEngram(ctx, workspaceA, overwriteA); err != nil {
+		t.Fatalf("batch.WriteEngram(overwrite workspaceA): %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("batch.Commit: %v", err)
+	}
+	metasA, err = store.GetMetadata(ctx, workspaceA, []ULID{id})
+	if err != nil || len(metasA) != 1 || metasA[0] == nil || metasA[0].Confidence != overwriteA.Confidence {
+		t.Fatalf("GetMetadata(workspaceA after batch overwrite) = %v, %v", metasA, err)
+	}
+
+	overwriteB = &Engram{ID: id, Concept: "vault B bulk overwrite", Content: "new bulk metadata", Confidence: 0.75, Relevance: 0.7}
+	_, writeErrs := store.WriteEngramBatch(ctx, []EngramBatchItem{{WSPrefix: workspaceB, Engram: overwriteB}})
+	if len(writeErrs) != 1 || writeErrs[0] != nil {
+		t.Fatalf("WriteEngramBatch errors=%v", writeErrs)
+	}
+	metasB, err = store.GetMetadata(ctx, workspaceB, []ULID{id})
+	if err != nil || len(metasB) != 1 || metasB[0] == nil || metasB[0].Confidence != overwriteB.Confidence {
+		t.Fatalf("GetMetadata(workspaceB after bulk overwrite) = %v, %v", metasB, err)
+	}
+}

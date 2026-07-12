@@ -354,6 +354,9 @@ const frameSize = 100
 // Run executes the 6-phase ACTIVATE pipeline.
 func (e *ActivationEngine) Run(ctx context.Context, req *ActivateRequest) (*ActivateResult, error) {
 	start := time.Now()
+	if req.ReadOnly {
+		ctx = storage.ContextWithPassiveReads(ctx)
+	}
 
 	if req.MaxResults <= 0 {
 		req.MaxResults = 10
@@ -390,7 +393,11 @@ func (e *ActivationEngine) Run(ctx context.Context, req *ActivateRequest) (*Acti
 	}
 
 	// Phase 4.75: Lazy archive restore — check Bloom filter, restore dormant edges.
-	restoredEdges := e.phase4_75ArchiveRestore(ctx, ws, fused)
+	// Observe-mode activation is a pure read and must leave archive/live indexes unchanged.
+	var restoredEdges []mbp.EdgeRef
+	if !req.ReadOnly {
+		restoredEdges = e.phase4_75ArchiveRestore(ctx, ws, fused)
+	}
 
 	// Resolve traversal profile for Phase 5 and for audit logging.
 	// Always resolved so ProfileUsed is set on every activation, regardless of HopDepth.

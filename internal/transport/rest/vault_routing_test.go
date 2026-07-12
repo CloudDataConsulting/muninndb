@@ -952,9 +952,14 @@ func TestVaultRouting_ResolveContradiction_ExplicitVault(t *testing.T) {
 // TestHandleSubscribe_UsesContextVault verifies that subscriptions use the
 // authenticated vault from context instead of re-reading the raw query param.
 func TestHandleSubscribe_UsesContextVault(t *testing.T) {
-	srv, eng, _ := newVaultTrackingServer(t)
+	srv, eng, store := newVaultTrackingServer(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "myvault", Public: true}); err != nil {
+		t.Fatal(err)
+	}
 
-	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), auth.ContextVault, "myvault"))
+	ctx := context.WithValue(context.Background(), auth.ContextVault, "myvault")
+	ctx = context.WithValue(ctx, auth.ContextPrincipal, auth.PrincipalPublic)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	req := httptest.NewRequest("GET", "/api/subscribe", nil).WithContext(ctx)
 	w := httptest.NewRecorder()
