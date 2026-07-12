@@ -5,11 +5,37 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 )
 
-var warnedUnconfiguredVaults sync.Map
+var unconfiguredVaultWarnings = struct {
+	sync.Mutex
+	windowStart time.Time
+	emitted     int
+}{}
+
+const (
+	unconfiguredVaultWarningWindow     = time.Minute
+	unconfiguredVaultWarningsPerWindow = 10
+)
+
+func warnUnconfiguredVault(vault string) {
+	now := time.Now()
+	unconfiguredVaultWarnings.Lock()
+	if unconfiguredVaultWarnings.windowStart.IsZero() || now.Sub(unconfiguredVaultWarnings.windowStart) >= unconfiguredVaultWarningWindow {
+		unconfiguredVaultWarnings.windowStart = now
+		unconfiguredVaultWarnings.emitted = 0
+	}
+	if unconfiguredVaultWarnings.emitted >= unconfiguredVaultWarningsPerWindow {
+		unconfiguredVaultWarnings.Unlock()
+		return
+	}
+	unconfiguredVaultWarnings.emitted++
+	unconfiguredVaultWarnings.Unlock()
+	slog.Warn("vault has no explicit config — defaulting to locked access (fail-closed); call SetVaultConfig to set an explicit policy", "vault", vault)
+}
 
 // GetVaultConfig returns the config for a vault.
 //
@@ -27,16 +53,15 @@ var warnedUnconfiguredVaults sync.Map
 //
 //	store.SetVaultConfig(auth.VaultConfig{Name: "myvault", Public: true})
 func (s *Store) GetVaultConfig(vault string) (VaultConfig, error) {
+	if !ValidVaultName(vault) {
+		return VaultConfig{}, fmt.Errorf("invalid vault name")
+	}
 	data, closer, err := s.db.Get(vaultConfigKey(vault))
 	if err != nil {
 		// Fail-closed: any vault that has never been explicitly configured
 		// requires an API key. Operators should call SetVaultConfig to
 		// establish an explicit policy for each vault.
-		if _, already := warnedUnconfiguredVaults.LoadOrStore(vault, struct{}{}); !already {
-			slog.Warn("vault has no explicit config — defaulting to locked access (fail-closed); call SetVaultConfig to set an explicit policy",
-				"vault", vault,
-			)
-		}
+		warnUnconfiguredVault(vault)
 		return VaultConfig{Name: vault, Public: false}, nil
 	}
 	defer closer.Close()
@@ -50,6 +75,9 @@ func (s *Store) GetVaultConfig(vault string) (VaultConfig, error) {
 
 // SetVaultConfig persists the vault configuration.
 func (s *Store) SetVaultConfig(cfg VaultConfig) error {
+	if !ValidVaultName(cfg.Name) {
+		return fmt.Errorf("invalid vault name")
+	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal vault config: %w", err)
@@ -60,6 +88,9 @@ func (s *Store) SetVaultConfig(cfg VaultConfig) error {
 // RenameVaultConfig moves a vault's config from oldName to newName.
 // If no config exists for oldName, this is a no-op (returns nil).
 func (s *Store) RenameVaultConfig(oldName, newName string) error {
+	if !ValidVaultName(oldName) || !ValidVaultName(newName) {
+		return fmt.Errorf("invalid vault name")
+	}
 	cfg, err := s.GetVaultConfig(oldName)
 	if err != nil {
 		return nil // no config → no-op
@@ -93,6 +124,9 @@ func (s *Store) RenameVaultConfig(oldName, newName string) error {
 // DeleteVaultConfig removes the vault configuration for the named vault.
 // If no config exists for the vault, this is a no-op and returns nil (idempotent).
 func (s *Store) DeleteVaultConfig(name string) error {
+	if !ValidVaultName(name) {
+		return fmt.Errorf("invalid vault name")
+	}
 	return s.db.Delete(vaultConfigKey(name), pebble.Sync)
 }
 

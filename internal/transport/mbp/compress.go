@@ -8,7 +8,8 @@ import (
 )
 
 const (
-	CompressionThreshold = 1024 // Compress payloads > 1KB
+	CompressionThreshold       = 1024 // Compress payloads > 1KB
+	maxDecompressedPayloadSize = MaxPayloadSize
 )
 
 // zstd encoder/decoder pools — lazily initialised on first use.
@@ -34,7 +35,13 @@ func initPools() error {
 			return enc
 		}
 		decoderPool.New = func() any {
-			dec, err := zstd.NewReader(nil)
+			dec, err := zstd.NewReader(
+				nil,
+				zstd.WithDecoderConcurrency(1),
+				zstd.WithDecoderLowmem(true),
+				zstd.WithDecoderMaxMemory(uint64(maxDecompressedPayloadSize)),
+				zstd.WithDecoderMaxWindow(uint64(maxDecompressedPayloadSize)),
+			)
 			if err != nil {
 				return fmt.Errorf("zstd decoder init: %w", err)
 			}
@@ -86,7 +93,6 @@ func CompressPayload(data []byte) ([]byte, bool, error) {
 
 // DecompressPayload decompresses zstd-compressed data with a size limit to prevent decompression bombs.
 func DecompressPayload(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 100 * 1024 * 1024 // 100 MB limit
 	if err := initPools(); err != nil {
 		return nil, fmt.Errorf("zstd unavailable: %w", err)
 	}
@@ -102,8 +108,8 @@ func DecompressPayload(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("zstd decompress: %w", err)
 	}
-	if len(decoded) > maxDecompressedSize {
-		return nil, fmt.Errorf("decompressed payload exceeds maximum size of %d bytes", maxDecompressedSize)
+	if len(decoded) > maxDecompressedPayloadSize {
+		return nil, fmt.Errorf("decompressed payload exceeds maximum size of %d bytes", maxDecompressedPayloadSize)
 	}
 	return decoded, nil
 }
