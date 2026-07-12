@@ -15,12 +15,13 @@ import (
 // Returns the vault engram count captured before deletion.
 //
 // Safe TOCTOU ordering:
-//  1. Point-delete VaultCountKey (0x15, 9-byte) from Pebble FIRST to prevent a
-//     concurrent writer from re-seeding the counter from the stale persisted value.
-//  2. Evict the in-memory vaultCounters entry — any subsequent write that races
-//     here now seeds from a scan of the (already range-tombstoned) key space → 0.
+//  1. Hold the vault lifecycle lock across count capture and range deletion, so
+//     Stat and every count-changing writer see either the pre-clear or post-clear
+//     canonical state, never the transition between them.
+//  2. Point-delete VaultCountKey (0x15, 9-byte), evict the in-memory counter,
+//     and discard any pending coalesced flush.
 //  3. Commit the range tombstones for all 20 vault-scoped data prefixes.
-//  4. Evict all in-memory caches (L1, assocCache, metaCache, recentActiveCache).
+//  4. Defensively evict the counter/flush again, then clear the other caches.
 //
 // Prefixes cleared (vault-scoped): 0x01–0x0D, 0x10, 0x12–0x17
 // Prefixes NOT cleared (global or name keys):
@@ -28,8 +29,18 @@ import (
 //   - 0x0F name index    (global by name hash, deleted by DeleteVaultNameOnly)
 //   - 0x11 digest flags  (globally keyed by ULID — orphans are acceptable)
 func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error) {
+	unlockCounter, err := ps.lockVaultCounterSet(ctx, [][8]byte{ws})
+	if err != nil {
+		return 0, fmt.Errorf("clear vault: lock counter: %w", err)
+	}
+	defer unlockCounter()
+
 	// Capture count before anything is deleted.
-	vaultCount := ps.GetVaultCount(ctx, ws)
+	vc, err := ps.getOrInitCounterLocked(ctx, ws)
+	if err != nil {
+		return 0, fmt.Errorf("clear vault: initialize counter: %w", err)
+	}
+	vaultCount := vc.count.Load()
 
 	// Step 1: point-delete VaultCountKey from Pebble FIRST (prevents stale re-seed).
 	// 0x15 | ws[8] = 9 bytes — the short form of the count key (not the EpisodeKey).
@@ -38,7 +49,8 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 		return 0, fmt.Errorf("clear vault: delete count key: %w", err)
 	}
 
-	// Step 2: evict in-memory counter (any concurrent write now re-seeds from scan → 0).
+	// Step 2: evict the in-memory counter. Waiting readers and writers cannot
+	// republish it until the lifecycle lock is released after the clear commits.
 	ps.vaultCounters.Delete(ws)
 	// Also drain any pending coalescer entry so a concurrent 100ms flush cannot
 	// write the stale count back to Pebble after the point-delete in Step 1.
@@ -78,11 +90,21 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 			return 0, fmt.Errorf("clear vault: delete range 0x%02X: %w", p, err)
 		}
 	}
+	if ps.clearBeforeCommitHook != nil {
+		ps.clearBeforeCommitHook(ws)
+	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return 0, fmt.Errorf("clear vault: commit: %w", err)
 	}
 
-	// Step 4: evict all in-memory caches.
+	// Step 4: defensively evict again and discard any stale pending flush. The
+	// lifecycle lock prevents lock-aware readers or writers from republishing the
+	// entry during clear; the second eviction also protects against future cache
+	// maintenance paths that do not change canonical records.
+	ps.vaultCounters.Delete(ws)
+	ps.counterFlush.Delete(ws)
+
+	// Step 5: evict all other in-memory caches.
 
 	// L1 engram cache — vault-scoped by hex prefix.
 	ps.cache.DeleteByVault(ws)

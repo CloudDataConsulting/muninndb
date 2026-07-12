@@ -445,19 +445,34 @@ components:
     StatResponse:
       type: object
       properties:
-        engramCount:
+        engram_count:
           type: integer
           format: int64
-        vaultCount:
+          description: "Memories in the authorized vault, or globally for an admin-global response."
+        vault_count:
           type: integer
-        indexSize:
+          description: "Vaults in scope; this is 1 for a vault-scoped response."
+        index_size:
           type: integer
           format: int64
-        storageBytes:
+          description: "Retained as zero when index_size_available is false."
+        storage_bytes:
           type: integer
           format: int64
+          description: "Retained as zero when storage_bytes_available is false."
+        stats_scope:
+          type: string
+          enum: [vault, global]
+        storage_bytes_available:
+          type: boolean
+        index_size_available:
+          type: boolean
         coherence:
           type: object
+          description: >-
+            Optional incremental diagnostics on legacy/admin-global responses.
+            Omitted when stats_scope is vault until coherence counters can be
+            reconciled with clone, merge, import, and canonical cardinality.
           additionalProperties:
             $ref: "#/components/schemas/CoherenceResult"
 
@@ -1530,7 +1545,12 @@ paths:
   /api/stats:
     get:
       tags: [health]
-      summary: "Return database statistics."
+      summary: "Return statistics for the authorized vault."
+      description: >-
+        Returns only the requested and authorized vault. vault_count therefore
+        means vaults in scope, not a database-wide tenant count. Per-vault disk
+        and index sizes are unavailable and their availability flags are false.
+        Database-global statistics are restricted to internal/admin surfaces.
       security:
         - BearerAuth: []
       parameters:
@@ -1541,7 +1561,7 @@ paths:
             default: "default"
       responses:
         "200":
-          description: "DB statistics."
+          description: "Vault-scoped statistics and availability metadata."
           content:
             application/json:
               schema:

@@ -9,6 +9,8 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && npm run test:types && node tests/stats-contract.mjs",
+    "test:types": "tsc --noEmit -p tsconfig.test.json",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

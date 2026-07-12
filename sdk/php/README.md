@@ -99,7 +99,7 @@ $client = new \MuninnDB\MuninnClient(
 );
 
 $stats = $client->stats();
-echo "Total engrams: {$stats->totalEngrams}";
+echo "Engrams in {$stats->statsScope} scope: {$stats->engramCount}";
 ```
 
 ### Vanilla PHP
@@ -297,8 +297,21 @@ $text = $client->guide();
 
 ```php
 $stats = $client->stats();
-echo "Engrams: {$stats->totalEngrams}, Links: {$stats->totalLinks}";
+echo "Engrams: {$stats->engramCount}, vaults in scope: {$stats->vaultCount}\n";
+
+if ($stats->storageBytesAvailable) {
+    echo "Storage bytes: {$stats->storageBytes}\n";
+}
 ```
+
+`statsScope` is `vault` or `global` on current servers and `unknown` when a
+legacy response omits scope. Read `storageBytes` and `indexSize` only when the
+matching availability flag is true. The legacy `totalEngrams`, `totalVaults`,
+and single `coherence` properties retain their original constructor contract.
+Missing legacy link counts retain their historical zero default, while a
+missing legacy vault count remains `null`. Scoped coherence is intentionally
+omitted until it can be reconciled with canonical cardinality; optional
+coherence properties remain for legacy/global responses.
 
 #### `listEngrams(vault, limit, offset)` — Paginated engram list
 

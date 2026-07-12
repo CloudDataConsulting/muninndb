@@ -399,10 +399,12 @@ class MuninnClient:
         return True
 
     async def stats(self, vault: str = "default") -> StatResponse:
-        """Get database statistics including coherence scores.
+        """Get statistics and coherence scores for one authorized vault.
 
         Returns:
-            StatResponse with engram count, vault count, storage bytes, and coherence
+            Vault-scoped statistics. ``vault_count`` is the number of vaults in
+            scope (normally 1), and byte counts are meaningful only when their
+            corresponding availability flags are true.
 
         Raises:
             MuninnError: If stats request fails
@@ -428,6 +430,10 @@ class MuninnClient:
             vault_count=response.get("vault_count", 0),
             storage_bytes=response.get("storage_bytes", 0),
             coherence=coherence,
+            stats_scope=response.get("stats_scope", "unknown"),
+            storage_bytes_available=response.get("storage_bytes_available", False),
+            index_size=response.get("index_size", 0),
+            index_size_available=response.get("index_size_available", False),
         )
 
     def subscribe(

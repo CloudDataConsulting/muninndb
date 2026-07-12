@@ -202,16 +202,16 @@
           <div class="stat-value" data-testid="stat-engram-count" x-text="stats.engramCount.toLocaleString()">0</div>
           <div class="stat-label">Engrams</div>
         </div>
-        <div class="stat-card" title="Isolated memory namespaces — use separate vaults for different projects or contexts">
+        <div class="stat-card" :title="stats.statsScope === 'vault' ? `This response is scoped to the '${vault}' vault` : stats.statsScope === 'global' ? 'All vaults visible to this server' : 'The server did not identify the statistics scope'">
           <div class="stat-value" x-text="stats.vaultCount">0</div>
-          <div class="stat-label">Vaults</div>
+          <div class="stat-label" x-text="stats.statsScope === 'vault' ? 'Current Vault' : stats.statsScope === 'global' ? 'Vaults' : 'Vaults in Scope'">Vaults in Scope</div>
         </div>
-        <div class="stat-card" :title="`Disk space used by the '${vault}' vault`">
-          <div class="stat-value" x-text="formatBytes(stats.storageBytes)">0 B</div>
+        <div class="stat-card" :title="stats.storageBytesAvailable ? `Disk space used by the '${vault}' vault` : 'Per-vault disk usage is not available'">
+          <div class="stat-value" x-text="stats.storageBytesAvailable ? formatBytes(stats.storageBytes) : 'Unavailable'">Unavailable</div>
           <div class="stat-label">Vault Storage</div>
         </div>
-        <div class="stat-card" title="Disk space used by the semantic similarity index (HNSW vector index)">
-          <div class="stat-value" x-text="formatBytes(stats.indexSize)">0 B</div>
+        <div class="stat-card" :title="stats.indexSizeAvailable ? 'Disk space used by the semantic similarity index (HNSW vector index)' : 'Per-vault index size is not available'">
+          <div class="stat-value" x-text="stats.indexSizeAvailable ? formatBytes(stats.indexSize) : 'Unavailable'">Unavailable</div>
           <div class="stat-label">Index Size</div>
         </div>
         <!-- Cognitive Workers card -->

@@ -752,6 +752,11 @@ func (ps *PebbleStore) UpdateDigest(ctx context.Context, id ULID, summary string
 	if !ok {
 		return fmt.Errorf("UpdateDigest: engram %s not found", id.String())
 	}
+	unlockVault, err := ps.lockVaultCounterSet(ctx, [][8]byte{ws})
+	if err != nil {
+		return fmt.Errorf("UpdateDigest: lock vault: %w", err)
+	}
+	defer unlockVault()
 
 	eng, err := ps.GetEngram(ctx, ws, id)
 	if err != nil {

@@ -205,13 +205,36 @@ func (c *Client) Forget(ctx context.Context, id, vault string) error {
 	return c.request(ctx, "DELETE", path, nil, nil)
 }
 
-// Stats gets database statistics.
+// Stats gets statistics for the scope selected by the server. Current servers
+// report that scope in StatsScope. A legacy response that omits stats_scope is
+// normalized to "unknown" and must not be assumed to be vault-scoped.
 func (c *Client) Stats(ctx context.Context) (*StatsResponse, error) {
 	resp := &StatsResponse{}
 	if err := c.request(ctx, "GET", "/api/stats", nil, resp); err != nil {
 		return nil, err
 	}
+	normalizeStatsScope(resp)
 	return resp, nil
+}
+
+// StatsForVault requests statistics for one explicitly named vault. Current
+// servers return StatsScope "vault". A legacy response that omits stats_scope
+// is normalized to "unknown" rather than being mislabeled as vault-scoped.
+func (c *Client) StatsForVault(ctx context.Context, vault string) (*StatsResponse, error) {
+	q := url.Values{}
+	q.Set("vault", vault)
+	resp := &StatsResponse{}
+	if err := c.request(ctx, "GET", "/api/stats?"+q.Encode(), nil, resp); err != nil {
+		return nil, err
+	}
+	normalizeStatsScope(resp)
+	return resp, nil
+}
+
+func normalizeStatsScope(resp *StatsResponse) {
+	if resp.StatsScope == "" {
+		resp.StatsScope = "unknown"
+	}
 }
 
 // Subscribe subscribes to vault events via Server-Sent Events.

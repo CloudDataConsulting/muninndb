@@ -43,6 +43,7 @@ export type {
   ContradictionItem,
   ContradictionsResponse,
   CoherenceResult,
+  StatsScope,
   StatsResponse,
   ListEngramsResponse,
   SessionEntry,

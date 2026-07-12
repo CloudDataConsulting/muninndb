@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -17,8 +18,9 @@ import (
 // stateUpdate records a (workspace, id) pair whose state was changed via
 // UpdateEngramState. Used by Commit to invalidate stale L1 cache entries.
 type stateUpdate struct {
-	ws [8]byte
-	id ULID
+	ws          [8]byte
+	id          ULID
+	expectedRaw []byte
 }
 
 // pebbleStoreBatch implements StoreBatch using a single pebble.Batch.
@@ -30,6 +32,7 @@ type pebbleStoreBatch struct {
 	// pendingItems collects metadata needed for post-commit side effects
 	// (vault counters, WAL entries, provenance). They are processed after Commit.
 	pendingItems []batchPendingItem
+	pendingIDs   map[[24]byte]struct{}
 	// stateUpdatedIDs tracks engrams whose state was changed by UpdateEngramState.
 	// Their cache entries are invalidated in Commit after the batch flushes to Pebble.
 	stateUpdatedIDs []stateUpdate
@@ -46,14 +49,18 @@ type batchPendingItem struct {
 // The caller must call Commit or Discard exactly once on the returned value.
 func (ps *PebbleStore) NewBatch() StoreBatch {
 	return &pebbleStoreBatch{
-		ps:    ps,
-		batch: ps.db.NewBatch(),
+		ps:         ps,
+		batch:      ps.db.NewBatch(),
+		pendingIDs: make(map[[24]byte]struct{}),
 	}
 }
 
 // WriteEngram queues all keys for eng into the batch (does not commit).
 // It applies the same defaulting and encoding logic as PebbleStore.WriteEngram.
 func (b *pebbleStoreBatch) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *Engram) error {
+	if b.committed {
+		return fmt.Errorf("batch already committed")
+	}
 	// Apply defaults — same as PebbleStore.WriteEngram.
 	if eng.ID == (ULID{}) {
 		if !eng.CreatedAt.IsZero() {
@@ -88,6 +95,13 @@ func (b *pebbleStoreBatch) WriteEngram(ctx context.Context, wsPrefix [8]byte, en
 	}
 
 	id16 := [16]byte(eng.ID)
+	var identity [24]byte
+	copy(identity[:8], wsPrefix[:])
+	copy(identity[8:], id16[:])
+	if _, duplicate := b.pendingIDs[identity]; duplicate {
+		return fmt.Errorf("%w: %s (duplicate batch ID)", ErrEngramAlreadyExists, eng.ID.String())
+	}
+	b.pendingIDs[identity] = struct{}{}
 
 	// 0x01: full engram record
 	b.batch.Set(keys.EngramKey(wsPrefix, id16), erfBytes, nil)
@@ -180,13 +194,19 @@ func (b *pebbleStoreBatch) UpdateEngramState(ctx context.Context, ws [8]byte, id
 	if b.committed {
 		return fmt.Errorf("batch already committed")
 	}
-	eng, err := b.ps.GetEngram(ctx, ws, id)
+	id16 := [16]byte(id)
+	expectedRaw, err := Get(b.ps.db, keys.EngramKey(ws, id16))
 	if err != nil {
-		return fmt.Errorf("update state: read engram: %w", err)
+		return fmt.Errorf("update state: read canonical engram: %w", err)
 	}
-	if eng == nil {
+	if expectedRaw == nil {
 		return fmt.Errorf("update state: engram %s not found", id.String())
 	}
+	erfEngram, err := erf.Decode(expectedRaw)
+	if err != nil {
+		return fmt.Errorf("update state: decode canonical engram: %w", err)
+	}
+	eng := fromERFEngram(erfEngram)
 	oldState := eng.State
 	eng.State = newState
 	eng.UpdatedAt = time.Now()
@@ -196,8 +216,6 @@ func (b *pebbleStoreBatch) UpdateEngramState(ctx context.Context, ws [8]byte, id
 	if err != nil {
 		return fmt.Errorf("update state: encode: %w", err)
 	}
-	id16 := [16]byte(id)
-
 	// Transition 0x0B state index: remove old entry, write new entry.
 	b.batch.Delete(keys.StateIndexKey(ws, uint8(oldState), id16), nil)
 	b.batch.Set(keys.StateIndexKey(ws, uint8(newState), id16), []byte{}, nil)
@@ -210,7 +228,11 @@ func (b *pebbleStoreBatch) UpdateEngramState(ctx context.Context, ws [8]byte, id
 		return err
 	}
 	// Track for cache invalidation in Commit.
-	b.stateUpdatedIDs = append(b.stateUpdatedIDs, stateUpdate{ws: ws, id: id})
+	b.stateUpdatedIDs = append(b.stateUpdatedIDs, stateUpdate{
+		ws:          ws,
+		id:          id,
+		expectedRaw: expectedRaw,
+	})
 	return nil
 }
 
@@ -226,7 +248,55 @@ func (b *pebbleStoreBatch) Commit() error {
 	if b.ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	ctx := context.Background()
+	counters := make(map[[8]byte]*vaultCounter)
+	vaults := make([][8]byte, 0, len(b.pendingItems)+len(b.stateUpdatedIDs))
+	for _, item := range b.pendingItems {
+		vaults = append(vaults, item.wsPrefix)
+	}
+	for _, update := range b.stateUpdatedIDs {
+		vaults = append(vaults, update.ws)
+	}
+	unlockCounters, err := b.ps.lockVaultCounterSet(ctx, vaults)
+	if err != nil {
+		return fmt.Errorf("lock vault counter: %w", err)
+	}
+
+	newIDsByVault := make(map[[8]byte][][16]byte)
+	for _, item := range b.pendingItems {
+		newIDsByVault[item.wsPrefix] = append(newIDsByVault[item.wsPrefix], [16]byte(item.eng.ID))
+	}
+	for ws, ids := range newIDsByVault {
+		if err := b.ps.ensureEngramIDsAbsentLocked(ws, ids); err != nil {
+			unlockCounters()
+			return fmt.Errorf("validate new engram identities: %w", err)
+		}
+	}
+	for _, update := range b.stateUpdatedIDs {
+		current, err := Get(b.ps.db, keys.EngramKey(update.ws, [16]byte(update.id)))
+		if err != nil {
+			unlockCounters()
+			return fmt.Errorf("validate pending state update: %w", err)
+		}
+		if current == nil || !bytes.Equal(current, update.expectedRaw) {
+			unlockCounters()
+			return fmt.Errorf("%w: %s", ErrEngramChanged, update.id.String())
+		}
+	}
+	for _, item := range b.pendingItems {
+		if _, ok := counters[item.wsPrefix]; !ok {
+			// Initialize before commit so the fallback scan cannot include the
+			// pending record and then count it again below.
+			vc, err := b.ps.getOrInitCounterLocked(ctx, item.wsPrefix)
+			if err != nil {
+				unlockCounters()
+				return fmt.Errorf("initialize vault counter: %w", err)
+			}
+			counters[item.wsPrefix] = vc
+		}
+	}
 	if err := b.batch.Commit(syncOption); err != nil {
+		unlockCounters()
 		return fmt.Errorf("batch commit: %w", err)
 	}
 
@@ -239,7 +309,6 @@ func (b *pebbleStoreBatch) Commit() error {
 	}
 
 	// Post-commit side effects — mirrors PebbleStore.WriteEngram post-commit work.
-	ctx := context.Background()
 	for _, item := range b.pendingItems {
 		ws := item.wsPrefix
 		eng := item.eng
@@ -248,7 +317,7 @@ func (b *pebbleStoreBatch) Commit() error {
 		b.ps.cache.Delete(ws, eng.ID)
 		b.ps.metaCache.Remove(metaCacheKey(ws, eng.ID))
 
-		vc := b.ps.getOrInitCounter(ctx, ws)
+		vc := counters[ws]
 		newCount := vc.count.Add(1)
 		if b.ps.counterFlush != nil {
 			if current, ok := b.ps.vaultCounters.Load(ws); ok && current.(*vaultCounter) == vc {
@@ -275,6 +344,7 @@ func (b *pebbleStoreBatch) Commit() error {
 			})
 		}
 	}
+	unlockCounters()
 
 	return nil
 }

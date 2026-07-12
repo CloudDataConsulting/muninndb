@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/scrypster/muninndb/internal/engine/trigger"
 	"github.com/scrypster/muninndb/internal/index/fts"
 	"github.com/scrypster/muninndb/internal/storage"
+	"github.com/scrypster/muninndb/internal/storage/keys"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
@@ -1000,6 +1002,58 @@ func TestActivateObserveModeDoesNotError(t *testing.T) {
 	}
 	if len(resp.Activations) == 0 {
 		t.Fatal("expected at least 1 activation from FTS")
+	}
+}
+
+func TestActivateObserveModeDoesNotInitializeVaultCounter(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	vault := "activate-observe-passive"
+	ws := eng.store.ResolveVaultPrefix(vault)
+	counterKey := keys.VaultCountKey(ws)
+	if value, err := storage.Get(eng.store.GetDB(), counterKey); err != nil || value != nil {
+		t.Fatalf("counter before observe Activate = %x err=%v, want absent", value, err)
+	}
+	if idle := eng.activity.IdleSince(ws); idle < 29*24*time.Hour {
+		t.Fatalf("fresh vault idle duration = %s, want unknown/inactive", idle)
+	}
+
+	observeCtx := context.WithValue(context.Background(), auth.ContextMode, auth.ModeObserve)
+	resp, err := eng.Activate(observeCtx, &mbp.ActivateRequest{
+		Vault:      vault,
+		Context:    []string{"no matching memories"},
+		MaxResults: 5,
+	})
+	if err != nil {
+		t.Fatalf("observe Activate: %v", err)
+	}
+	if resp == nil || len(resp.Activations) != 0 || resp.TotalFound != 0 {
+		t.Fatalf("observe Activate = %#v, want exact empty result", resp)
+	}
+	if value, err := storage.Get(eng.store.GetDB(), counterKey); err != nil || value != nil {
+		t.Fatalf("counter after observe Activate = %x err=%v, want absent", value, err)
+	}
+	if idle := eng.activity.IdleSince(ws); idle < 29*24*time.Hour {
+		t.Fatalf("observe Activate marked vault active: idle=%s", idle)
+	}
+
+	if _, err := eng.Activate(context.Background(), &mbp.ActivateRequest{
+		Vault:      vault,
+		Context:    []string{"no matching memories"},
+		MaxResults: 5,
+	}); err != nil {
+		t.Fatalf("normal Activate: %v", err)
+	}
+	value, err := storage.Get(eng.store.GetDB(), counterKey)
+	if err != nil {
+		t.Fatalf("read normal Activate counter: %v", err)
+	}
+	if len(value) != 8 || binary.BigEndian.Uint64(value) != 0 {
+		t.Fatalf("normal Activate counter = %x, want persisted zero value", value)
+	}
+	if idle := eng.activity.IdleSince(ws); idle > time.Minute {
+		t.Fatalf("normal Activate did not mark vault active: idle=%s", idle)
 	}
 }
 

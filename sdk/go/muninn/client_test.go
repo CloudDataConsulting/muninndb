@@ -108,6 +108,71 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestStatsForVaultPreservesScopeAndAvailability(t *testing.T) {
+	var queryVault string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queryVault = r.URL.Query().Get("vault")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(StatsResponse{
+			EngramCount:           42,
+			VaultCount:            1,
+			StatsScope:            "vault",
+			StorageBytesAvailable: false,
+			IndexSizeAvailable:    false,
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-token")
+	stats, err := client.StatsForVault(context.Background(), "client-a")
+	if err != nil {
+		t.Fatalf("StatsForVault: %v", err)
+	}
+	if queryVault != "client-a" {
+		t.Fatalf("vault query = %q, want client-a", queryVault)
+	}
+	if stats.StatsScope != "vault" || stats.VaultCount != 1 {
+		t.Fatalf("stats = %#v, want one-vault scope", stats)
+	}
+	if stats.StorageBytesAvailable || stats.IndexSizeAvailable {
+		t.Fatalf("unavailable sizes decoded as available: %#v", stats)
+	}
+}
+
+func TestStatsNormalizesMissingScopeToUnknown(t *testing.T) {
+	srv := httptest.NewServer(mockHandler(200, map[string]any{
+		"engram_count": 42,
+		"vault_count":  7,
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-token")
+	stats, err := client.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.StatsScope != "unknown" {
+		t.Fatalf("StatsScope = %q, want unknown", stats.StatsScope)
+	}
+}
+
+func TestStatsForVaultNormalizesMissingScopeToUnknown(t *testing.T) {
+	srv := httptest.NewServer(mockHandler(200, map[string]any{
+		"engram_count": 42,
+		"vault_count":  7,
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "test-token")
+	stats, err := client.StatsForVault(context.Background(), "client-a")
+	if err != nil {
+		t.Fatalf("StatsForVault: %v", err)
+	}
+	if stats.StatsScope != "unknown" {
+		t.Fatalf("StatsScope = %q, want unknown", stats.StatsScope)
+	}
+}
+
 func TestEvolve(t *testing.T) {
 	srv := httptest.NewServer(mockHandler(200, EvolveResponse{ID: "evolved-1"}))
 	defer srv.Close()

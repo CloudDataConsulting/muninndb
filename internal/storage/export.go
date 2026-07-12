@@ -292,12 +292,14 @@ func (ps *PebbleStore) ImportVaultData(
 	// It is populated when we encounter the data.kvs entry and referenced
 	// after the loop completes to handle checksum verification and final commit.
 	type kvState struct {
-		engramCount int64
-		totalKeys   int64
-		batch       *pebble.Batch
-		batchCount  int
-		h           interface{ Sum([]byte) []byte } // sha256 hash
-		committed   bool
+		engramCount      int64
+		totalKeys        int64
+		batch            *pebble.Batch
+		batchCount       int
+		batchEngramCount int
+		batchEngramIDs   [][16]byte
+		h                interface{ Sum([]byte) []byte } // sha256 hash
+		committed        bool
 	}
 	var kv *kvState
 
@@ -337,7 +339,6 @@ func (ps *PebbleStore) ImportVaultData(
 				return nil, fmt.Errorf("import: dimension mismatch: archive=%d, expected=%d",
 					manifest.Dimension, opts.ExpectedDimension)
 			}
-
 			// Replay the KV stream into pebble directly from tr (no io.ReadAll).
 			// Compute SHA256 of the stream while reading for later checksum verification.
 			h := sha256.New()
@@ -352,6 +353,8 @@ func (ps *PebbleStore) ImportVaultData(
 
 			batch := ps.db.NewBatch()
 			batchCount := 0
+			batchEngramCount := 0
+			batchEngramIDs := make([][16]byte, 0, exportBatchSize)
 
 			var lenBuf [4]byte
 
@@ -377,6 +380,10 @@ func (ps *PebbleStore) ImportVaultData(
 					batch.Close()
 					return nil, fmt.Errorf("import: read key: %w", err)
 				}
+				if len(strippedKey) == 0 {
+					batch.Close()
+					return nil, fmt.Errorf("import: malformed empty key")
+				}
 
 				// Read value length.
 				if _, err := io.ReadFull(teeR, lenBuf[:]); err != nil {
@@ -399,6 +406,10 @@ func (ps *PebbleStore) ImportVaultData(
 				copy(fullKey[9:], strippedKey[1:])
 
 				prefix := strippedKey[0]
+				if prefix == 0x01 && len(strippedKey) != 17 {
+					batch.Close()
+					return nil, fmt.Errorf("import: malformed engram key length %d, want 17", len(strippedKey))
+				}
 
 				// Deduplication: for EngramKey (0x01), check if this engram already exists
 				// in the target vault. If it does, record its ID in skipIDs so that all
@@ -472,29 +483,37 @@ func (ps *PebbleStore) ImportVaultData(
 				batch.Set(fullKey, val, nil)
 				if strippedKey[0] == 0x01 {
 					engramCount++
+					batchEngramCount++
+					var id [16]byte
+					copy(id[:], strippedKey[1:17])
+					batchEngramIDs = append(batchEngramIDs, id)
 				}
 				totalKeys++
 				batchCount++
 
 				if batchCount >= exportBatchSize {
-					if err := batch.Commit(pebble.NoSync); err != nil {
+					if _, err := ps.commitBatchWithVaultCountDelta(ctx, wsTarget, batch, pebble.NoSync, batchEngramIDs, int64(batchEngramCount)); err != nil {
 						batch.Close()
 						return nil, fmt.Errorf("import: commit batch: %w", err)
 					}
 					batch.Close()
 					batch = ps.db.NewBatch()
 					batchCount = 0
+					batchEngramCount = 0
+					batchEngramIDs = batchEngramIDs[:0]
 				}
 			}
 
 			// Hold the final batch uncommitted — defer commit until checksum passes
 			// (or until we confirm there's no checksum entry for backward compat).
 			kv = &kvState{
-				engramCount: engramCount,
-				totalKeys:   totalKeys,
-				batch:       batch,
-				batchCount:  batchCount,
-				h:           h,
+				engramCount:      engramCount,
+				totalKeys:        totalKeys,
+				batch:            batch,
+				batchCount:       batchCount,
+				batchEngramCount: batchEngramCount,
+				batchEngramIDs:   batchEngramIDs,
+				h:                h,
 			}
 
 		case "checksum.txt":
@@ -517,17 +536,13 @@ func (ps *PebbleStore) ImportVaultData(
 			}
 			// Checksum verified — commit the final batch now.
 			if kv.batchCount > 0 {
-				if err := kv.batch.Commit(pebble.Sync); err != nil {
+				if _, err := ps.commitBatchWithVaultCountDelta(ctx, wsTarget, kv.batch, pebble.Sync, kv.batchEngramIDs, int64(kv.batchEngramCount)); err != nil {
 					kv.batch.Close()
 					return nil, fmt.Errorf("import: commit final batch (after checksum): %w", err)
 				}
 			}
 			kv.batch.Close()
 			kv.committed = true
-
-			// Seed the in-memory vault counter.
-			vc := ps.getOrInitCounter(ctx, wsTarget)
-			vc.count.Store(kv.engramCount)
 		}
 	}
 
@@ -537,16 +552,12 @@ func (ps *PebbleStore) ImportVaultData(
 		slog.Warn("import: archive has no checksum.txt — skipping integrity check (legacy export)",
 			"vault", vaultName)
 		if kv.batchCount > 0 {
-			if err := kv.batch.Commit(pebble.NoSync); err != nil {
+			if _, err := ps.commitBatchWithVaultCountDelta(ctx, wsTarget, kv.batch, pebble.NoSync, kv.batchEngramIDs, int64(kv.batchEngramCount)); err != nil {
 				kv.batch.Close()
 				return nil, fmt.Errorf("import: commit final batch: %w", err)
 			}
 		}
 		kv.batch.Close()
-
-		// Seed the in-memory vault counter.
-		vc := ps.getOrInitCounter(ctx, wsTarget)
-		vc.count.Store(kv.engramCount)
 
 		return &ExportResult{
 			EngramCount: kv.engramCount,

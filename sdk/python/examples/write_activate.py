@@ -15,6 +15,7 @@ from muninn import MuninnClient
 
 async def main():
     """Write and activate example."""
+    vault = "default"
     async with MuninnClient("http://localhost:8476") as client:
         print("MuninnDB Write → Activate Demo\n")
 
@@ -90,20 +91,16 @@ async def main():
 
         # Get database stats
         print("\n" + "=" * 50)
-        stats = await client.stats()
-        print(f"\nDatabase statistics:")
-        print(f"  Total engrams: {stats.engram_count}")
-        print(f"  Total vaults: {stats.vault_count}")
-        print(f"  Storage: {stats.storage_bytes:,} bytes")
-
-        if stats.coherence:
-            print(f"\nCoherence metrics:")
-            for vault_name, coherence in stats.coherence.items():
-                print(f"  Vault '{vault_name}':")
-                print(f"    Score: {coherence.score:.3f}")
-                print(f"    Orphan ratio: {coherence.orphan_ratio:.3f}")
-                print(f"    Duplication pressure: {coherence.duplication_pressure:.3f}")
-
+        stats = await client.stats(vault=vault)
+        print(f"\nStatistics for vault '{vault}':")
+        print(f"  Engrams: {stats.engram_count}")
+        print(f"  Vaults in scope: {stats.vault_count}")
+        storage = (
+            f"{stats.storage_bytes:,} bytes"
+            if stats.storage_bytes_available
+            else "unavailable per vault"
+        )
+        print(f"  Storage: {storage}")
 
 if __name__ == "__main__":
     asyncio.run(main())

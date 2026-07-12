@@ -118,10 +118,13 @@ type StatRequest struct {
 
 // StatResponse message
 type StatResponse struct {
-	EngramCount  int64 `protobuf:"varint,1,opt,name=engram_count"`
-	StorageBytes int64 `protobuf:"varint,2,opt,name=storage_bytes"`
-	VaultCount   int32 `protobuf:"varint,3,opt,name=vault_count"`
-	IndexSize    int64 `protobuf:"varint,4,opt,name=index_size"`
+	EngramCount           int64  `protobuf:"varint,1,opt,name=engram_count"`
+	StorageBytes          int64  `protobuf:"varint,2,opt,name=storage_bytes"`
+	VaultCount            int32  `protobuf:"varint,3,opt,name=vault_count"`
+	IndexSize             int64  `protobuf:"varint,4,opt,name=index_size"`
+	StatsScope            string `protobuf:"bytes,5,opt,name=stats_scope"`
+	StorageBytesAvailable bool   `protobuf:"varint,6,opt,name=storage_bytes_available"`
+	IndexSizeAvailable    bool   `protobuf:"varint,7,opt,name=index_size_available"`
 }
 
 // LinkRequest message

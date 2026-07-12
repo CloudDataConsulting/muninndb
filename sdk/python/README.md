@@ -154,19 +154,26 @@ await client.link(
 
 #### `stats() → StatResponse`
 
-Get database statistics and coherence metrics.
+Get exact statistics for one authorized vault.
 
 ```python
-stats = await client.stats()
+stats = await client.stats(vault="default")
 print(f"Engrams: {stats.engram_count}")
-print(f"Storage: {stats.storage_bytes} bytes")
+print(f"Vaults in scope: {stats.vault_count}")
+if stats.storage_bytes_available:
+    print(f"Storage: {stats.storage_bytes} bytes")
+else:
+    print("Storage: unavailable per vault")
 
-if stats.coherence:
-    for vault_name, coherence in stats.coherence.items():
-        print(f"Vault {vault_name} coherence: {coherence.score:.2f}")
 ```
 
-**Returns:** `StatResponse` with engram_count, vault_count, storage_bytes, and coherence dict
+**Returns:** `StatResponse` with vault-scoped counts, explicit size-availability
+flags, and `stats_scope`. `vault_count` is not a database-wide tenant count.
+Scoped coherence is intentionally omitted until incremental registry counters
+can be reconciled with clone/merge/import and canonical cardinality. The
+optional coherence model remains for legacy/global responses. A legacy server
+that omits `stats_scope` is reported as `unknown`; the SDK does not guess that
+an unlabelled global response is vault-scoped.
 
 ---
 
@@ -272,7 +279,7 @@ Subscribes to a vault and writes an engram, demonstrating SSE push events.
 python examples/cognitive_loop.py
 ```
 
-Full workflow: write → activate → link → inspect coherence.
+Full workflow: write → activate → link → inspect exact scoped statistics.
 
 ## Retry Logic
 

@@ -65,7 +65,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("stats failed: %v", err)
 	}
-	fmt.Printf("\nTotal engrams: %d, vaults: %d\n", stats.EngramCount, stats.VaultCount)
+	fmt.Printf("\nStats scope: %s\n", stats.StatsScope)
+	fmt.Printf("Engrams in scope: %d; vaults in scope: %d\n",
+		stats.EngramCount, stats.VaultCount)
+	if stats.StatsScope == "unknown" {
+		fmt.Println("The server did not identify the stats scope; do not assume these counts are vault-scoped.")
+	}
+	if stats.StorageBytesAvailable {
+		fmt.Printf("Storage bytes: %d\n", stats.StorageBytes)
+	} else {
+		fmt.Println("Storage bytes: unavailable for this scope")
+	}
+	if stats.IndexSizeAvailable {
+		fmt.Printf("Index size: %d\n", stats.IndexSize)
+	} else {
+		fmt.Println("Index size: unavailable for this scope")
+	}
 
 	// List vaults
 	vaults, err := client.ListVaults(ctx)

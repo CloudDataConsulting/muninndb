@@ -430,11 +430,24 @@ func TestHandleStats_WithVault(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
+	body := w.Body.Bytes()
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	for _, key := range []string{"stats_scope", "storage_bytes_available", "index_size_available"} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("response omitted %q: %s", key, body)
+		}
+	}
 	var resp StatResponse
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+	if err := json.Unmarshal(body, &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if resp.EngramCount != 100 {
 		t.Errorf("expected 100 engrams, got %d", resp.EngramCount)
+	}
+	if resp.StatsScope != "vault" || resp.StorageBytesAvailable || resp.IndexSizeAvailable {
+		t.Errorf("unexpected scope/availability: %#v", resp)
 	}
 }

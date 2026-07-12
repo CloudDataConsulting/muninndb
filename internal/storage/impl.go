@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -34,16 +35,25 @@ type PebbleStoreConfig struct {
 
 // PebbleStore is the concrete Pebble-backed implementation of EngineStore.
 type PebbleStore struct {
-	db            *pebble.DB
-	cache         *L1Cache
-	mol           *wal.MOL
-	gc            *wal.GroupCommitter
-	noSyncEngrams bool
-	vaultCounters sync.Map          // [8]byte -> *vaultCounter
-	provenance    *provenance.Store // Provenance chain for tracking engram creation/updates
-	walSync       *walSyncer        // Periodic WAL fsync — covers all pebble.NoSync writes
-	counterFlush  *counterCoalescer // Coalesces vault count Pebble writes (100ms timer)
-	provWork      *provenanceWorker // NumCPU goroutines for provenance appends
+	db                *pebble.DB
+	cache             *L1Cache
+	mol               *wal.MOL
+	gc                *wal.GroupCommitter
+	noSyncEngrams     bool
+	vaultCounters     sync.Map          // [8]byte -> *vaultCounter
+	vaultCounterLocks sync.Map          // [8]byte -> per-vault canonical-mutation/count lock
+	provenance        *provenance.Store // Provenance chain for tracking engram creation/updates
+	walSync           *walSyncer        // Periodic WAL fsync — covers all pebble.NoSync writes
+	counterFlush      *counterCoalescer // Coalesces vault count Pebble writes (100ms timer)
+	provWork          *provenanceWorker // NumCPU goroutines for provenance appends
+	// counterInitHook is used only by storage package tests to pause a first
+	// counter reconciliation at a deterministic point. Production code leaves
+	// it nil.
+	counterInitHook func([8]byte)
+	// clearBeforeCommitHook and deleteAfterReadHook are deterministic storage
+	// test seams. Production code leaves both nil.
+	clearBeforeCommitHook func([8]byte)
+	deleteAfterReadHook   func([8]byte, ULID)
 	// assocCache: [24]byte (wsPrefix[8]+engramID[16]) → *assocCacheEntry
 	// Caches forward association lists to avoid repeated Pebble SSTable scans on hot engrams.
 	// Invalidated on any WriteAssociation or UpdateAssociation for that engram.
@@ -74,6 +84,7 @@ type PebbleStore struct {
 	// ever seen); stripedMutex uses a constant 256 × sizeof(sync.Mutex) ≈ 6 KB.
 	entityLocks       stripedMutex // prevents TOCTOU in UpsertEntityRecord
 	coOccurrenceLocks stripedMutex // prevents TOCTOU in IncrementEntityCoOccurrence
+	engramDeleteLocks stripedMutex // prevents duplicate hard-delete transitions
 	// archiveBloom is an in-memory Bloom filter over src engram IDs that have
 	// archived associations in the 0x25 namespace. Gates the 0x25 prefix scan
 	// during BFS traversal: if the filter says "no," skip the scan entirely.
@@ -98,62 +109,109 @@ type recentActiveCacheEntry struct {
 	expires int64 // unix nanoseconds
 }
 
-// vaultCounter tracks the engram count for a vault.
-// sync.Once ensures the counter is seeded from Pebble exactly once per vault per process lifetime.
+// vaultCounter tracks the engram count for a vault. The creator closes ready
+// only after the canonical scan has completed and count is safe to use.
 type vaultCounter struct {
-	once  sync.Once
-	count atomic.Int64
+	ready   chan struct{}
+	initErr error
+	count   atomic.Int64
 }
 
-// getOrInitCounter returns the vault counter, initializing it from Pebble on first access.
-func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *vaultCounter {
-	if v, ok := ps.vaultCounters.Load(wsPrefix); ok {
-		return v.(*vaultCounter)
+// getOrInitCounter returns the vault counter, reconciling it from canonical
+// Pebble records on first access. The candidate is published before the scan so
+// concurrent readers and writers share the same barrier instead of racing a
+// scan against increments. A failed or canceled scan is removed from the map,
+// allowing the next healthy request to retry rather than permanently caching a
+// stale or zero count.
+func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) (*vaultCounter, error) {
+	unlock, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return nil, err
 	}
-	vc := &vaultCounter{}
-	actual, _ := ps.vaultCounters.LoadOrStore(wsPrefix, vc)
-	loaded := actual.(*vaultCounter)
-	loaded.once.Do(func() {
-		// Try to read persisted count from Pebble
-		countKey := keys.VaultCountKey(wsPrefix)
-		val, err := Get(ps.db, countKey)
-		if err == nil && len(val) == 8 {
-			n := int64(binary.BigEndian.Uint64(val))
-			loaded.count.Store(n)
-			return
+	defer unlock()
+	return ps.getOrInitCounterLocked(ctx, wsPrefix)
+}
+
+// getOrInitCounterLocked requires the caller to hold wsPrefix's lifecycle
+// lock. It publishes a ready channel as an additional defensive barrier for
+// callers that inspect vaultCounters directly.
+func (ps *PebbleStore) getOrInitCounterLocked(ctx context.Context, wsPrefix [8]byte) (*vaultCounter, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		// Fall back to per-vault scan (one-time cost on first startup)
-		n, _ := ps.countEngramsForVault(ctx, wsPrefix)
-		loaded.count.Store(n)
-		// Persist so next startup avoids the scan
+
+		candidate := &vaultCounter{ready: make(chan struct{})}
+		actual, loaded := ps.vaultCounters.LoadOrStore(wsPrefix, candidate)
+		vc := actual.(*vaultCounter)
+		if loaded {
+			select {
+			case <-vc.ready:
+				if vc.initErr != nil {
+					// The failed candidate has been evicted. Retry against the
+					// replacement using this caller's still-live context.
+					continue
+				}
+				return vc, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		// This goroutine published candidate and therefore owns initialization.
+		// Reconcile from canonical records; the persisted counter is only a
+		// write-through accelerator and may lag after an abrupt crash.
+		n, scanErr := ps.countEngramsForVault(ctx, wsPrefix)
+		if scanErr == nil && ps.counterInitHook != nil {
+			ps.counterInitHook(wsPrefix)
+		}
+		if scanErr != nil {
+			candidate.initErr = scanErr
+			ps.vaultCounters.CompareAndDelete(wsPrefix, candidate)
+			close(candidate.ready)
+			return nil, scanErr
+		}
+
+		candidate.count.Store(n)
+		countKey := keys.VaultCountKey(wsPrefix)
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, uint64(n))
-		_ = ps.db.Set(countKey, buf, pebble.NoSync)
-	})
-	return loaded
+		if err := ps.db.Set(countKey, buf, pebble.NoSync); err != nil {
+			slog.Warn("storage: failed to persist reconciled vault counter", "err", err)
+		}
+		close(candidate.ready)
+		return candidate, nil
+	}
 }
 
 // countEngramsForVault scans the 0x01 prefix for a single vault.
 func (ps *PebbleStore) countEngramsForVault(ctx context.Context, wsPrefix [8]byte) (int64, error) {
-	lower := keys.EngramKey(wsPrefix, [16]byte{})
-	upperWS := wsPrefix
-	for i := 7; i >= 0; i-- {
-		upperWS[i]++
-		if upperWS[i] != 0 {
-			break
-		}
+	return ps.countEngramsForVaultReader(ctx, ps.db, wsPrefix)
+}
+
+// countEngramsForVaultReader scans canonical 0x01 records using reader. Keeping
+// the reader explicit lets passive callers use a point-in-time snapshot without
+// publishing an in-memory counter or repairing the persisted 0x15 accelerator.
+func (ps *PebbleStore) countEngramsForVaultReader(ctx context.Context, reader pebble.Reader, wsPrefix [8]byte) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	upper := make([]byte, 1+8)
-	upper[0] = 0x01
-	copy(upper[1:9], upperWS[:])
-	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	prefix := make([]byte, 1+len(wsPrefix))
+	prefix[0] = 0x01
+	copy(prefix[1:], wsPrefix[:])
+	lower := keys.PrefixLowerBound(prefix)
+	upper := keys.PrefixUpperBound(prefix)
+	iter, err := reader.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return 0, err
 	}
 	defer iter.Close()
 	var count int64
 	for valid := iter.First(); valid; valid = iter.Next() {
-		if len(iter.Key()) >= 25 {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if len(iter.Key()) == 25 {
 			count++
 		}
 	}
@@ -163,9 +221,52 @@ func (ps *PebbleStore) countEngramsForVault(ctx context.Context, wsPrefix [8]byt
 	return count, nil
 }
 
-// GetVaultCount returns the current engram count for a vault.
+// GetVaultCountReadOnly returns an exact canonical count without creating or
+// updating the in-memory vault counter, its persisted 0x15 accelerator, the
+// counter coalescer, or the per-vault lifecycle lock. If ctx already carries a
+// Pebble snapshot, the count is taken from that same point-in-time view;
+// otherwise this method owns a short-lived snapshot for the scan.
+//
+// Observe-mode request paths should use this method. Normal and mutating paths
+// should continue through GetVaultCountChecked/getOrInitCounter so subsequent
+// writes can maintain and persist an initialized counter.
+func (ps *PebbleStore) GetVaultCountReadOnly(ctx context.Context, wsPrefix [8]byte) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if snap, ok := ctx.Value(snapshotCtxKey{}).(*pebble.Snapshot); ok && snap != nil {
+		return ps.countEngramsForVaultReader(ctx, snap, wsPrefix)
+	}
+
+	snap := ps.db.NewSnapshot()
+	defer snap.Close()
+	return ps.countEngramsForVaultReader(ctx, snap, wsPrefix)
+}
+
+// GetVaultCountChecked returns the current engram count for a vault or an
+// initialization error. Request paths that must not report stale data should
+// use this method.
+func (ps *PebbleStore) GetVaultCountChecked(ctx context.Context, wsPrefix [8]byte) (int64, error) {
+	vc, err := ps.getOrInitCounter(ctx, wsPrefix)
+	if err != nil {
+		return 0, err
+	}
+	return vc.count.Load(), nil
+}
+
+// GetVaultCount returns the current engram count for legacy/internal callers
+// whose interface cannot return an error. It never caches a failed
+// initialization; a later healthy call will retry the canonical scan.
 func (ps *PebbleStore) GetVaultCount(ctx context.Context, wsPrefix [8]byte) int64 {
-	return ps.getOrInitCounter(ctx, wsPrefix).count.Load()
+	n, err := ps.GetVaultCountChecked(ctx, wsPrefix)
+	if err == nil {
+		return n
+	}
+	slog.Warn("storage: failed to reconcile vault counter", "err", err)
+	if val, readErr := Get(ps.db, keys.VaultCountKey(wsPrefix)); readErr == nil && len(val) == 8 {
+		return int64(binary.BigEndian.Uint64(val))
+	}
+	return 0
 }
 
 // NewPebbleStore creates a new PebbleStore wrapping a Pebble database and L1 cache.
@@ -184,7 +285,13 @@ func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 		assocCache:       assocCache,
 	}
 	ps.walSync = newWALSyncer(db)
-	ps.counterFlush = newCounterCoalescer(db)
+	ps.counterFlush = newCounterCoalescer(db, func(ws [8]byte) func() {
+		unlock, err := ps.lockVaultCounterSet(context.Background(), [][8]byte{ws})
+		if err != nil {
+			return func() {}
+		}
+		return unlock
+	})
 	ps.provWork = newProvenanceWorker(prov)
 	ps.transCache = NewTransitionCache(ps)
 	ps.archiveBloom = ps.RebuildArchiveBloom()
@@ -317,7 +424,23 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	// Initialize before commit so the fallback scan cannot observe this write
+	// and then count it a second time in the post-commit increment.
+	unlockCounter, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return ULID{}, fmt.Errorf("lock vault counter: %w", err)
+	}
+	if err := ps.ensureEngramIDsAbsentLocked(wsPrefix, [][16]byte{[16]byte(eng.ID)}); err != nil {
+		unlockCounter()
+		return ULID{}, fmt.Errorf("write engram: %w", err)
+	}
+	vc, err := ps.getOrInitCounterLocked(ctx, wsPrefix)
+	if err != nil {
+		unlockCounter()
+		return ULID{}, fmt.Errorf("initialize vault counter: %w", err)
+	}
 	if err := batch.Commit(syncOption); err != nil {
+		unlockCounter()
 		return ULID{}, fmt.Errorf("commit batch: %w", err)
 	}
 
@@ -327,17 +450,16 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	ps.metaCache.Remove(metaCacheKey(wsPrefix, eng.ID))
 
 	// Vault counter: in-memory atomic; coalescer persists every 100ms.
-	// Load-or-init before the Add so we hold a reference to the live counter.
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
 	newCount := vc.count.Add(1)
-	// Only submit if vc is still the current counter for this vault.
-	// ClearVault may have evicted the counter between Add and Submit; in that
-	// case submitting would re-seed the coalescer with a stale count.
+	// Only submit if vc is still the current counter for this vault. The vault
+	// lock prevents ClearVault from evicting it between Add and Submit; the
+	// identity check remains defensive against future cache-maintenance paths.
 	if ps.counterFlush != nil {
 		if current, ok := ps.vaultCounters.Load(wsPrefix); ok && current.(*vaultCounter) == vc {
 			ps.counterFlush.Submit(wsPrefix, newCount)
 		}
 	}
+	unlockCounter()
 
 	// WAL MOL entry (async, non-blocking).
 	if ps.gc != nil {
@@ -391,6 +513,7 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 
 	batch := ps.db.NewBatch()
 	defer batch.Close()
+	seenIDs := make(map[[24]byte]struct{}, n)
 
 	for i := range items {
 		eng := items[i].Engram
@@ -421,13 +544,20 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		if eng.LastAccess.IsZero() {
 			eng.LastAccess = eng.CreatedAt
 		}
-
 		erfEng := toERFEngram(eng)
 		erfBytes, encErr := erf.EncodeV2(erfEng)
 		if encErr != nil {
 			errs[i] = fmt.Errorf("encode engram: %w", encErr)
 			continue
 		}
+		var identity [24]byte
+		copy(identity[:8], ws[:])
+		copy(identity[8:], eng.ID[:])
+		if _, duplicate := seenIDs[identity]; duplicate {
+			errs[i] = fmt.Errorf("%w: %s (duplicate batch ID)", ErrEngramAlreadyExists, eng.ID.String())
+			continue
+		}
+		seenIDs[identity] = struct{}{}
 
 		id16 := [16]byte(eng.ID)
 		batch.Set(keys.EngramKey(ws, id16), erfBytes, nil)
@@ -480,7 +610,63 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	counters := make(map[[8]byte]*vaultCounter)
+	vaults := make([][8]byte, 0, len(items))
+	for i := range items {
+		if errs[i] == nil {
+			vaults = append(vaults, items[i].WSPrefix)
+		}
+	}
+	unlockCounters, lockErr := ps.lockVaultCounterSet(ctx, vaults)
+	if lockErr != nil {
+		for j := range errs {
+			if errs[j] == nil {
+				errs[j] = fmt.Errorf("lock vault counter: %w", lockErr)
+			}
+		}
+		return ids, errs
+	}
+	newIDsByVault := make(map[[8]byte][][16]byte)
+	for i := range items {
+		if errs[i] == nil {
+			ws := items[i].WSPrefix
+			newIDsByVault[ws] = append(newIDsByVault[ws], [16]byte(items[i].Engram.ID))
+		}
+	}
+	for ws, newIDs := range newIDsByVault {
+		if err := ps.ensureEngramIDsAbsentLocked(ws, newIDs); err != nil {
+			unlockCounters()
+			for j := range errs {
+				if errs[j] == nil {
+					errs[j] = fmt.Errorf("write engram batch: %w", err)
+				}
+			}
+			return ids, errs
+		}
+	}
+	for i := range items {
+		if errs[i] != nil {
+			continue
+		}
+		ws := items[i].WSPrefix
+		if _, ok := counters[ws]; !ok {
+			// Initialize before commit so the fallback scan sees only records that
+			// predate this batch.
+			vc, err := ps.getOrInitCounterLocked(ctx, ws)
+			if err != nil {
+				unlockCounters()
+				for j := range errs {
+					if errs[j] == nil {
+						errs[j] = fmt.Errorf("initialize vault counter: %w", err)
+					}
+				}
+				return ids, errs
+			}
+			counters[ws] = vc
+		}
+	}
 	if commitErr := batch.Commit(syncOption); commitErr != nil {
+		unlockCounters()
 		for i := range errs {
 			if errs[i] == nil {
 				errs[i] = fmt.Errorf("commit batch: %w", commitErr)
@@ -501,7 +687,7 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		ps.cache.Delete(ws, eng.ID)
 		ps.metaCache.Remove(metaCacheKey(ws, eng.ID))
 
-		vc := ps.getOrInitCounter(ctx, ws)
+		vc := counters[ws]
 		newCount := vc.count.Add(1)
 		if ps.counterFlush != nil {
 			if current, ok := ps.vaultCounters.Load(ws); ok && current.(*vaultCounter) == vc {
@@ -528,6 +714,7 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 			})
 		}
 	}
+	unlockCounters()
 
 	return ids, errs
 }

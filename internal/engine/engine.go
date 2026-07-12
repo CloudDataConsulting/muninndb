@@ -43,13 +43,13 @@ type CognitiveForwarder interface {
 
 // Engine is the cognitive database engine implementing mbp.EngineAPI.
 type Engine struct {
-	store            *storage.PebbleStore
-	authStore        *auth.Store // nil = use Plasticity defaults (e.g. in tests)
-	fts              *fts.Index
-	ftsWorker        *fts.Worker  // async FTS indexing — decoupled from write hot path
-	activation       *activation.ActivationEngine
-	triggers         *trigger.TriggerSystem
-	engramCount      atomic.Int64
+	store       *storage.PebbleStore
+	authStore   *auth.Store // nil = use Plasticity defaults (e.g. in tests)
+	fts         *fts.Index
+	ftsWorker   *fts.Worker // async FTS indexing — decoupled from write hot path
+	activation  *activation.ActivationEngine
+	triggers    *trigger.TriggerSystem
+	engramCount atomic.Int64
 	// ──────────────────────────────────────────────────────────────────
 	// Cognitive Worker Subsystem
 	// ──────────────────────────────────────────────────────────────────
@@ -106,26 +106,26 @@ type Engine struct {
 	// code (or server.go in standalone) is responsible for calling
 	// hebbianWorker.Stop(), etc. before the process exits.
 	// ──────────────────────────────────────────────────────────────────
-	cogMu              sync.RWMutex
-	hebbianWorker      *cognitive.HebbianWorker
-	contradictWorker   *cognitive.Worker[cognitive.ContradictItem]
-	confidenceWorker   *cognitive.Worker[cognitive.ConfidenceUpdate]
-	transitionWorker   *cognitive.TransitionWorker
+	cogMu            sync.RWMutex
+	hebbianWorker    *cognitive.HebbianWorker
+	contradictWorker *cognitive.Worker[cognitive.ContradictItem]
+	confidenceWorker *cognitive.Worker[cognitive.ConfidenceUpdate]
+	transitionWorker *cognitive.TransitionWorker
 	activity         *cognitive.ActivityTracker
-	embedder activation.Embedder // optional embedder for embedding-based brief scoring
+	embedder         activation.Embedder // optional embedder for embedding-based brief scoring
 	// Feature subsystems (all optional, nil-safe)
-	autoAssoc      *autoassoc.Worker    // write-time automatic tag-based associations
-	neighborWorker *autoassoc.NeighborWorker // semantic neighbor auto-linking
-	goalLinkWorker *autoassoc.GoalLinkWorker  // goal-aware semantic auto-linking
-	noveltyDet           *novelty.Detector // write-time near-duplicate detection
-	noveltyJobs          chan noveltyJob    // async novelty work queue
-	noveltyDone          chan struct{}      // signals novelty worker shutdown
-	pruneDone            chan struct{}      // signals prune worker shutdown
-	idempotencySweepDone chan struct{}      // signals idempotency sweep worker shutdown
-	archiveGCDone        chan struct{}      // signals archive GC worker shutdown
-	coherence   *coherence.Registry // per-vault incremental coherence counters
-	scoring     *scoring.Store      // per-vault learnable scoring weights
-	prov        *provenance.Store   // audit trail per-engram
+	autoAssoc            *autoassoc.Worker         // write-time automatic tag-based associations
+	neighborWorker       *autoassoc.NeighborWorker // semantic neighbor auto-linking
+	goalLinkWorker       *autoassoc.GoalLinkWorker // goal-aware semantic auto-linking
+	noveltyDet           *novelty.Detector         // write-time near-duplicate detection
+	noveltyJobs          chan noveltyJob           // async novelty work queue
+	noveltyDone          chan struct{}             // signals novelty worker shutdown
+	pruneDone            chan struct{}             // signals prune worker shutdown
+	idempotencySweepDone chan struct{}             // signals idempotency sweep worker shutdown
+	archiveGCDone        chan struct{}             // signals archive GC worker shutdown
+	coherence            *coherence.Registry       // per-vault incremental coherence counters
+	scoring              *scoring.Store            // per-vault learnable scoring weights
+	prov                 *provenance.Store         // audit trail per-engram
 
 	// Fix 5: coherence persistence lifecycle
 	coherenceFlushStop chan struct{}
@@ -185,10 +185,10 @@ type Engine struct {
 	stopOnce sync.Once
 
 	// Vault lifecycle fields
-	vaultOpsMu   sync.Mutex     // guards name reservation in StartClone/StartMerge
-	jobManager   *vaultjob.Manager  // tracks async clone/merge jobs
-	stopCtx      context.Context    // cancelled on Stop() to signal goroutines
-	stopCancel   context.CancelFunc
+	vaultOpsMu sync.Mutex        // guards name reservation in StartClone/StartMerge
+	jobManager *vaultjob.Manager // tracks async clone/merge jobs
+	stopCtx    context.Context   // cancelled on Stop() to signal goroutines
+	stopCancel context.CancelFunc
 
 	// Goroutine lifecycle tracking — see spawnFireAndForget and spawnJob.
 	// Per-request fire-and-forget goroutines (Read, RecordAccess).
@@ -198,7 +198,7 @@ type Engine struct {
 	jobWG      sync.WaitGroup
 	jobStopped atomic.Bool
 
-	hnswRegistry *hnsw.Registry     // per-vault HNSW indexes (shared with activation)
+	hnswRegistry *hnsw.Registry // per-vault HNSW indexes (shared with activation)
 
 	// vaultMu provides per-vault mutual exclusion for destructive vault operations
 	// (PruneVault, ReindexFTSVault, ClearVault). Maps string vault name → *sync.Mutex.
@@ -324,8 +324,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 		activity:         cognitive.NewActivityTracker(),
 		embedder:         cfg.Embedder,
 		autoAssoc:        autoassoc.New(stopCtx, store, cfg.FTSIndex),
-		neighborWorker:  autoassoc.NewNeighborWorker(stopCtx, store, cfg.HNSWRegistry),
-		goalLinkWorker:  autoassoc.NewGoalLinkWorker(stopCtx, store, cfg.HNSWRegistry),
+		neighborWorker:   autoassoc.NewNeighborWorker(stopCtx, store, cfg.HNSWRegistry),
+		goalLinkWorker:   autoassoc.NewGoalLinkWorker(stopCtx, store, cfg.HNSWRegistry),
 		noveltyDet:       novelty.New(),
 		noveltyJobs:      make(chan noveltyJob, 256),
 		noveltyDone:      make(chan struct{}),
@@ -336,8 +336,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 		stopCtx:          stopCtx,
 		stopCancel:       stopCancel,
 		hnswRegistry:     cfg.HNSWRegistry,
-		jobManager:          vaultjob.NewManager(),
-		replayFailCounts:    make(map[storage.ULID]int),
+		jobManager:       vaultjob.NewManager(),
+		replayFailCounts: make(map[storage.ULID]int),
 	}
 	// Start async novelty worker to decouple O(N) Jaccard scan from write hot path.
 	// engine:spawn-ok — tracked by noveltyDone channel, drained in Stop()
@@ -567,9 +567,9 @@ func (e *Engine) Stop() {
 //
 // MUST be used instead of bare `go` for all per-request goroutines.
 func (e *Engine) spawnFireAndForget(fn func()) bool {
-	e.fireAndForgetWG.Add(1)            // Add FIRST — visible to wg.Wait() in Stop()
+	e.fireAndForgetWG.Add(1) // Add FIRST — visible to wg.Wait() in Stop()
 	if e.fireAndForgetStopped.Load() {
-		e.fireAndForgetWG.Done()         // Undo — engine is shutting down
+		e.fireAndForgetWG.Done() // Undo — engine is shutting down
 		return false
 	}
 	// engine:spawn-ok — tracked by fireAndForgetWG, drained in Stop() before store.Close()
@@ -586,9 +586,9 @@ func (e *Engine) spawnFireAndForget(fn func()) bool {
 //
 // MUST be used instead of bare `go` for all vault job goroutines.
 func (e *Engine) spawnJob(fn func()) bool {
-	e.jobWG.Add(1)                      // Add FIRST — visible to wg.Wait() in Stop()
+	e.jobWG.Add(1) // Add FIRST — visible to wg.Wait() in Stop()
 	if e.jobStopped.Load() {
-		e.jobWG.Done()                   // Undo — engine is shutting down
+		e.jobWG.Done() // Undo — engine is shutting down
 		return false
 	}
 	// engine:spawn-ok — tracked by jobWG, drained in Stop() before jobManager.Close()
@@ -1012,7 +1012,6 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		})
 	}
 
-
 	// Write-time semantic neighbor linking: find semantically similar engrams via HNSW.
 	if e.neighborWorker != nil && len(eng.Embedding) > 0 {
 		e.neighborWorker.EnqueueNeighborJob(autoassoc.NeighborJob{
@@ -1075,15 +1074,15 @@ var ErrBatchTooLarge = fmt.Errorf("batch size exceeds maximum of %d", MaxBatchSi
 // the prepared engram plus post-commit metadata. This avoids re-deriving
 // vault prefixes and enrichment fields after the batch commits.
 type preparedBatchItem struct {
-	wsPrefix                [8]byte
-	vaultName               string
-	eng                     *storage.Engram
-	inlineMode              string
-	callerSummary           string
-	callerEntities          []mbp.InlineEntity
-	callerRelationships     []mbp.InlineRelationship
+	wsPrefix                  [8]byte
+	vaultName                 string
+	eng                       *storage.Engram
+	inlineMode                string
+	callerSummary             string
+	callerEntities            []mbp.InlineEntity
+	callerRelationships       []mbp.InlineRelationship
 	callerEntityRelationships []mbp.InlineEntityRelationship
-	skipBackgroundEnrich    bool
+	skipBackgroundEnrich      bool
 }
 
 // WriteBatch writes multiple engrams in a single Pebble batch commit, then
@@ -1493,21 +1492,21 @@ func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadRespo
 	metrics.ReadDuration.WithLabelValues(req.Vault).Observe(d.Seconds())
 
 	return &mbp.ReadResponse{
-		ID:             eng.ID.String(),
-		Concept:        eng.Concept,
-		Content:        eng.Content,
-		Confidence:     eng.Confidence,
-		Relevance:      eng.Relevance,
-		Stability:      eng.Stability,
-		AccessCount:    eng.AccessCount,
-		Tags:           eng.Tags,
-		State:          uint8(eng.State),
-		CreatedAt:      eng.CreatedAt.UnixNano(),
-		UpdatedAt:      eng.UpdatedAt.UnixNano(),
-		LastAccess:     eng.LastAccess.UnixNano(),
-		Summary:        eng.Summary,
-		KeyPoints:      eng.KeyPoints,
-		MemoryType:     uint8(eng.MemoryType),
+		ID:                  eng.ID.String(),
+		Concept:             eng.Concept,
+		Content:             eng.Content,
+		Confidence:          eng.Confidence,
+		Relevance:           eng.Relevance,
+		Stability:           eng.Stability,
+		AccessCount:         eng.AccessCount,
+		Tags:                eng.Tags,
+		State:               uint8(eng.State),
+		CreatedAt:           eng.CreatedAt.UnixNano(),
+		UpdatedAt:           eng.UpdatedAt.UnixNano(),
+		LastAccess:          eng.LastAccess.UnixNano(),
+		Summary:             eng.Summary,
+		KeyPoints:           eng.KeyPoints,
+		MemoryType:          uint8(eng.MemoryType),
 		TypeLabel:           eng.TypeLabel,
 		Classification:      eng.Classification,
 		EmbedDim:            uint8(eng.EmbedDim),
@@ -1558,7 +1557,16 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	if !observe {
 		e.activity.Record(wsPrefix)
 	}
-	vaultSize := e.store.GetVaultCount(ctx, wsPrefix)
+	var vaultSize int64
+	if observe {
+		var err error
+		vaultSize, err = e.store.GetVaultCountReadOnly(ctx, wsPrefix)
+		if err != nil {
+			return nil, fmt.Errorf("activation: count vault: %w", err)
+		}
+	} else {
+		vaultSize = e.store.GetVaultCount(ctx, wsPrefix)
+	}
 	vaultID := wsVaultID(wsPrefix)
 	actReq := &activation.ActivateRequest{
 		VaultID:            vaultID,
@@ -2142,6 +2150,34 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 
 // Stat implements mbp.EngineAPI.Stat.
 func (e *Engine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatResponse, error) {
+	// A named vault is a tenant-scoped request. Return only values that can be
+	// computed truthfully for that vault. Global database size and global
+	// coherence registries are intentionally unavailable: clone/merge/import can
+	// leave incremental coherence counters behind canonical cardinality, so a
+	// scoped response must not present them as exact vault facts.
+	if req.Vault != "" {
+		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+		var engramCount int64
+		var err error
+		if auth.ObserveFromContext(ctx) {
+			engramCount, err = e.store.GetVaultCountReadOnly(ctx, wsPrefix)
+		} else {
+			engramCount, err = e.store.GetVaultCountChecked(ctx, wsPrefix)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat: reconcile vault count: %w", err)
+		}
+		resp := &mbp.StatResponse{
+			EngramCount:           engramCount,
+			VaultCount:            1,
+			StatsScope:            "vault",
+			StorageBytesAvailable: false,
+			IndexSizeAvailable:    false,
+		}
+
+		return resp, nil
+	}
+
 	vaultNames, _ := e.store.ListVaultNames()
 
 	// Count all vaults: data vaults + config-only (empty) vaults, deduplicated.
@@ -2164,16 +2200,13 @@ func (e *Engine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatRespo
 		vaultCount = 1 // preserve the existing "minimum 1" semantics
 	}
 
-	engramCount := e.engramCount.Load()
-	if req.Vault != "" {
-		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
-		engramCount = e.store.GetVaultCount(ctx, wsPrefix)
-	}
-
 	resp := &mbp.StatResponse{
-		EngramCount:  engramCount,
-		VaultCount:   vaultCount,
-		StorageBytes: e.store.DiskSize(),
+		EngramCount:           e.engramCount.Load(),
+		VaultCount:            vaultCount,
+		StorageBytes:          e.store.DiskSize(),
+		StatsScope:            "global",
+		StorageBytesAvailable: true,
+		IndexSizeAvailable:    false,
 	}
 
 	// Attach coherence scores for all vaults if the registry is populated.
@@ -2182,19 +2215,23 @@ func (e *Engine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatRespo
 		if len(snapshots) > 0 {
 			resp.CoherenceScores = make(map[string]mbp.CoherenceResult, len(snapshots))
 			for _, snap := range snapshots {
-				resp.CoherenceScores[snap.VaultName] = mbp.CoherenceResult{
-					Score:                snap.Score,
-					OrphanRatio:          snap.OrphanRatio,
-					ContradictionDensity: snap.ContradictionDensity,
-					DuplicationPressure:  snap.DuplicationPressure,
-					TemporalVariance:     snap.TemporalVariance,
-					TotalEngrams:         snap.TotalEngrams,
-				}
+				resp.CoherenceScores[snap.VaultName] = coherenceResult(snap)
 			}
 		}
 	}
 
 	return resp, nil
+}
+
+func coherenceResult(snap coherence.Result) mbp.CoherenceResult {
+	return mbp.CoherenceResult{
+		Score:                snap.Score,
+		OrphanRatio:          snap.OrphanRatio,
+		ContradictionDensity: snap.ContradictionDensity,
+		DuplicationPressure:  snap.DuplicationPressure,
+		TemporalVariance:     snap.TemporalVariance,
+		TotalEngrams:         snap.TotalEngrams,
+	}
 }
 
 // ListVaults returns all vault names that have been written to.

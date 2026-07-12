@@ -48,7 +48,20 @@ async function main() {
     console.log(`\nVaults: ${vaults.join(', ')}`);
 
     const stats = await client.stats();
-    console.log(`Total engrams: ${stats.total_engrams}`);
+    console.log(
+      `Stats (${stats.stats_scope} scope): ${stats.engram_count} engrams, ` +
+      `${stats.vault_count} vaults in scope`,
+    );
+    console.log(
+      stats.storage_bytes_available
+        ? `Storage bytes: ${stats.storage_bytes}`
+        : 'Storage bytes: unavailable for this scope',
+    );
+    console.log(
+      stats.index_size_available
+        ? `Index size: ${stats.index_size}`
+        : 'Index size: unavailable for this scope',
+    );
   } finally {
     client.close();
   }

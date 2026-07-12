@@ -259,21 +259,34 @@ func (r *Registry) RestoreVault(name string, data [7]int64) {
 	vc.Restore(data)
 }
 
+// Snapshot returns a point-in-time result for one named vault without walking
+// or exposing the rest of the registry.
+func (r *Registry) Snapshot(name string) (Result, bool) {
+	r.mu.RLock()
+	c, ok := r.vaults[name]
+	r.mu.RUnlock()
+	if !ok {
+		return Result{}, false
+	}
+	return c.Snapshot(name), true
+}
+
 // Snapshots returns Result for all vaults.
 func (r *Registry) Snapshots() []Result {
+	type entry struct {
+		name     string
+		counters *VaultCounters
+	}
 	r.mu.RLock()
-	names := make([]string, 0, len(r.vaults))
-	for name := range r.vaults {
-		names = append(names, name)
+	entries := make([]entry, 0, len(r.vaults))
+	for name, counters := range r.vaults {
+		entries = append(entries, entry{name: name, counters: counters})
 	}
 	r.mu.RUnlock()
 
-	results := make([]Result, 0, len(names))
-	for _, name := range names {
-		r.mu.RLock()
-		c := r.vaults[name]
-		r.mu.RUnlock()
-		results = append(results, c.Snapshot(name))
+	results := make([]Result, 0, len(entries))
+	for _, entry := range entries {
+		results = append(results, entry.counters.Snapshot(entry.name))
 	}
 	return results
 }

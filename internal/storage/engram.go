@@ -257,6 +257,12 @@ func (ps *PebbleStore) GetMetadata(ctx context.Context, wsPrefix [8]byte, ids []
 // If the state changes, it also updates the 0x0B state secondary index.
 // Patches the raw 0x01 bytes in-place (no full re-encode).
 func (ps *PebbleStore) UpdateMetadata(ctx context.Context, wsPrefix [8]byte, id ULID, meta *EngramMeta) error {
+	unlockVault, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return fmt.Errorf("update metadata: lock vault: %w", err)
+	}
+	defer unlockVault()
+
 	// Read slim metadata to detect state change (needed for index update).
 	oldMetas, err := ps.GetMetadata(ctx, wsPrefix, []ULID{id})
 	if err != nil {
@@ -339,6 +345,12 @@ func (ps *PebbleStore) UpdateMetadata(ctx context.Context, wsPrefix [8]byte, id 
 // It moves the relevance bucket key (0x10) from the old bucket to the new bucket,
 // and patches the raw 0x01 bytes in-place (no full re-encode).
 func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id ULID, relevance, stability float32) error {
+	unlockVault, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return fmt.Errorf("update relevance: lock vault: %w", err)
+	}
+	defer unlockVault()
+
 	// Read slim metadata to get the old relevance for bucket key movement.
 	metas, err := ps.GetMetadata(ctx, wsPrefix, []ULID{id})
 	if err != nil {
@@ -403,16 +415,65 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 // DeleteEngram performs a hard delete: removes the engram, all association keys,
 // and all secondary indexes. Reads the engram first to gather index data.
 func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id ULID) error {
+	var deleteKey [24]byte
+	copy(deleteKey[:8], wsPrefix[:])
+	copy(deleteKey[8:], id[:])
+	deleteMu := ps.engramDeleteLocks.For(deleteKey[:])
+	deleteMu.Lock()
+	defer deleteMu.Unlock()
+	unlockCounter, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return fmt.Errorf("delete engram: lock vault counter: %w", err)
+	}
+	counterLocked := true
+	defer func() {
+		if counterLocked {
+			unlockCounter()
+		}
+	}()
+
 	// Read engram to collect secondary index data for cleanup.
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
-		// Not found or unreadable — attempt key-only delete as fallback.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		// Not found or unreadable — attempt key-only delete as fallback. Check
+		// canonical existence first so a corrupt-but-present record decrements the
+		// maintained count exactly once, while an already-absent record does not.
+		engramKey := keys.EngramKey(wsPrefix, [16]byte(id))
+		_, closer, getErr := ps.db.Get(engramKey)
+		existed := getErr == nil
+		if closer != nil {
+			closer.Close()
+		}
+		if getErr != nil && getErr != pebble.ErrNotFound {
+			return fmt.Errorf("delete engram: verify canonical record: %w", getErr)
+		}
+		var vc *vaultCounter
+		if existed {
+			vc, err = ps.getOrInitCounterLocked(ctx, wsPrefix)
+			if err != nil {
+				return fmt.Errorf("delete engram: initialize vault counter: %w", err)
+			}
+		}
 		batch := ps.db.NewBatch()
 		defer batch.Close()
-		batch.Delete(keys.EngramKey(wsPrefix, [16]byte(id)), nil)
+		batch.Delete(engramKey, nil)
 		batch.Delete(keys.MetaKey(wsPrefix, [16]byte(id)), nil)
 		ps.cache.Delete(wsPrefix, id)
-		return batch.Commit(pebble.NoSync)
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			return err
+		}
+		if existed {
+			ps.decrementVaultCounter(wsPrefix, vc)
+		}
+		unlockCounter()
+		counterLocked = false
+		return nil
+	}
+	if ps.deleteAfterReadHook != nil {
+		ps.deleteAfterReadHook(wsPrefix, id)
 	}
 
 	batch := ps.db.NewBatch()
@@ -535,9 +596,18 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		slog.Warn("storage: entity link cleanup failed on delete, links may be orphaned", "engram", id.String(), "err", err)
 	}
 
+	// Initialize before commit so the fallback scan still sees the record that
+	// will be removed. The post-commit decrement then produces the exact count.
+	vc, err := ps.getOrInitCounterLocked(ctx, wsPrefix)
+	if err != nil {
+		return fmt.Errorf("delete engram: initialize vault counter: %w", err)
+	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("delete engram: %w", err)
 	}
+	ps.decrementVaultCounter(wsPrefix, vc)
+	unlockCounter()
+	counterLocked = false
 
 	ps.cache.Delete(wsPrefix, id)
 
@@ -573,9 +643,10 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		}
 	}
 
-	// Decrement vault count synchronously to avoid a race where callers
-	// observe a stale count after DeleteEngram returns.
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
+	return nil
+}
+
+func (ps *PebbleStore) decrementVaultCounter(wsPrefix [8]byte, vc *vaultCounter) {
 	newCount := vc.count.Add(-1)
 	if newCount < 0 {
 		vc.count.Store(0)
@@ -586,13 +657,22 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	if err := ps.db.Set(keys.VaultCountKey(wsPrefix), buf, pebble.Sync); err != nil {
 		slog.Warn("storage: failed to persist vault count", "error", err)
 	}
-
-	return nil
+	if ps.counterFlush != nil {
+		// Replace any older pending increment so the coalescer cannot later
+		// overwrite this synchronous decrement with a stale higher value.
+		ps.counterFlush.Submit(wsPrefix, newCount)
+	}
 }
 
 // SoftDelete sets state to StateSoftDeleted and updates the record.
 // It also transitions the 0x0B state secondary index from the old state to StateSoftDeleted.
 func (ps *PebbleStore) SoftDelete(ctx context.Context, wsPrefix [8]byte, id ULID) error {
+	unlockVault, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return fmt.Errorf("soft delete: lock vault: %w", err)
+	}
+	defer unlockVault()
+
 	// Read engram
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
@@ -651,6 +731,12 @@ func (ps *PebbleStore) SoftDelete(ctx context.Context, wsPrefix [8]byte, id ULID
 // present are left as orphans (safe: they point to a valid engram, just stale).
 // For the dedup use-case (tags are always a superset) there are no removals.
 func (ps *PebbleStore) UpdateTags(ctx context.Context, wsPrefix [8]byte, id ULID, tags []string) error {
+	unlockVault, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return fmt.Errorf("update tags: lock vault: %w", err)
+	}
+	defer unlockVault()
+
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
 		return err
@@ -735,6 +821,12 @@ func (ps *PebbleStore) GetConfidence(ctx context.Context, wsPrefix [8]byte, id U
 
 // UpdateConfidence updates the confidence in 0x02 metadata (and 0x01 full engram).
 func (ps *PebbleStore) UpdateConfidence(ctx context.Context, wsPrefix [8]byte, id ULID, confidence float32) error {
+	unlockVault, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return fmt.Errorf("update confidence: lock vault: %w", err)
+	}
+	defer unlockVault()
+
 	// Read current engram
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
