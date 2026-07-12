@@ -11,6 +11,7 @@ on:
       - proto/**
       - scripts/check-generated-proto.sh
       - scripts/generate-proto.sh
+      - scripts/validate-generated-proto.sh
   pull_request:
     branches: [develop, main]
     paths:
@@ -21,6 +22,7 @@ on:
       - proto/**
       - scripts/check-generated-proto.sh
       - scripts/generate-proto.sh
+      - scripts/validate-generated-proto.sh
   workflow_dispatch:
 
 permissions:
@@ -48,23 +50,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Generate and check committed stubs
-        id: generated
+      - name: Generate canonical stubs
+        run: ./scripts/generate-proto.sh
+
+      - name: Validate canonical generator identity
+        run: ./scripts/validate-generated-proto.sh
+
+      - name: Check committed stubs for drift
+        id: drift
         continue-on-error: true
         run: ./scripts/check-generated-proto.sh
-
-      # This artifact is the only supported bootstrap path while local Buf and
-      # protoc installation is intentionally out of scope. It contains complete
-      # canonical output for both generated Go files even when the drift gate
-      # correctly fails the first bootstrap run.
-      - name: Upload canonical stubs when committed output drifts
-        if: steps.generated.outcome == 'failure'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: canonical-go-stubs
-          path: proto/gen/go
-          if-no-files-found: error
-          retention-days: 7
 
       - name: Test generated descriptor and default-codec wire contract
         run: >-
@@ -73,10 +68,26 @@ jobs:
           ./internal/transport/grpc
 
       - name: Vet generated transport
-        run: go vet -tags grpcwire ./proto/gen/go/muninn/v1 ./internal/transport/grpc
+        run: >-
+          go vet -tags grpcwire
+          ./proto/gen/go/muninn/v1
+          ./internal/transport/grpc
+
+      # Only expose the two canonical files after generation, identity checks,
+      # default-codec tests, and vet have all succeeded.
+      - name: Upload canonical stubs when committed output drifts
+        if: success() && steps.drift.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: canonical-go-stubs
+          path: |
+            proto/gen/go/muninn/v1/service.pb.go
+            proto/gen/go/muninn/v1/service_grpc.pb.go
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Enforce generated-code drift gate
-        if: steps.generated.outcome == 'failure'
+        if: success() && steps.drift.outcome == 'failure'
         run: |
           echo "Canonical generated Go stubs differ from the committed files."
           echo "Use the canonical-go-stubs artifact from this run."

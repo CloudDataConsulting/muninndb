@@ -1,6 +1,6 @@
 //go:build grpcwire
 
-package muninn_v1_test
+package grpc_test
 
 import (
 	"fmt"

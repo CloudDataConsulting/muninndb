@@ -26,3 +26,21 @@ The `grpcwire` tests freeze all message field numbers, message kinds and
 cardinality, service method names, streaming shapes, and full RPC paths. Any
 intentional v1 wire change must update those expectations explicitly and pass
 independent compatibility review.
+
+## Go source compatibility gate
+
+Canonical generation preserves protobuf field numbers and RPC paths, but it
+changes the exported Go source API that the handwritten files accidentally
+defined. Initialisms follow generator naming (`ID` becomes `Id`, `TTL` becomes
+`Ttl`, and `OK` becomes `Ok`), and repeated message fields become pointer slices
+such as `[]*Association`, `[]*Filter`, and `[]*ActivationItem`.
+
+The in-repository gRPC transport and tests are migrated in this bootstrap.
+
+TODO before this work can be marked ready:
+
+- Inventory every downstream consumer of
+  `github.com/scrypster/muninndb/proto/gen/go/muninn/v1`.
+- Decide whether a source-compatibility wrapper or a versioned breaking-change
+  release note is required.
+- Record and independently review the migration plan.
