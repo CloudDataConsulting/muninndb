@@ -235,7 +235,7 @@ func (b *pebbleStoreBatch) Commit() error {
 	// pre-commit state and must be evicted so subsequent reads see the new state.
 	for _, su := range b.stateUpdatedIDs {
 		b.ps.cache.Delete(su.ws, su.id)
-		b.ps.metaCache.Remove([16]byte(su.id))
+		b.ps.metaCache.Remove(metaCacheKey(su.ws, su.id))
 	}
 
 	// Post-commit side effects — mirrors PebbleStore.WriteEngram post-commit work.
@@ -243,6 +243,10 @@ func (b *pebbleStoreBatch) Commit() error {
 	for _, item := range b.pendingItems {
 		ws := item.wsPrefix
 		eng := item.eng
+		// Do not populate caches on write, and evict any existing entry in case
+		// an import intentionally supplied an already-present ULID.
+		b.ps.cache.Delete(ws, eng.ID)
+		b.ps.metaCache.Remove(metaCacheKey(ws, eng.ID))
 
 		vc := b.ps.getOrInitCounter(ctx, ws)
 		newCount := vc.count.Add(1)

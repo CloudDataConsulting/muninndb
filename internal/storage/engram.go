@@ -18,8 +18,16 @@ import (
 // GetEngram reads a full engram record by ID.
 func (ps *PebbleStore) GetEngram(ctx context.Context, wsPrefix [8]byte, id ULID) (*Engram, error) {
 	// Check L1 cache first (vault-scoped to prevent cross-vault cache hits).
-	if eng, found := ps.cache.Get(wsPrefix, id); found {
-		return eng, nil
+	passive := passiveReadsFromContext(ctx)
+	var cached *Engram
+	var found bool
+	if passive {
+		cached, found = ps.cache.Peek(wsPrefix, id)
+	} else {
+		cached, found = ps.cache.Get(wsPrefix, id)
+	}
+	if found {
+		return cached, nil
 	}
 
 	// Get from pebble
@@ -41,8 +49,11 @@ func (ps *PebbleStore) GetEngram(ctx context.Context, wsPrefix [8]byte, id ULID)
 	// Convert back to storage.Engram
 	eng := fromERFEngram(erfEng)
 
-	// Cache it (vault-scoped).
-	ps.cache.Set(wsPrefix, id, eng)
+	// Cache it (vault-scoped). Passive reads deliberately leave cache misses
+	// uncached so they do not create a synthetic cognitive access timestamp.
+	if !passive {
+		ps.cache.Set(wsPrefix, id, eng)
+	}
 
 	return eng, nil
 }
@@ -65,6 +76,7 @@ func (ps *PebbleStore) EngramLastAccessNs(wsPrefix [8]byte, id ULID) int64 {
 // Callers must check for nil before dereferencing.
 func (ps *PebbleStore) GetEngrams(ctx context.Context, wsPrefix [8]byte, ids []ULID) ([]*Engram, error) {
 	result := make([]*Engram, len(ids))
+	passive := passiveReadsFromContext(ctx)
 
 	// Phase 1: serve L1-cached engrams without touching Pebble.
 	type uncachedEntry struct {
@@ -74,7 +86,14 @@ func (ps *PebbleStore) GetEngrams(ctx context.Context, wsPrefix [8]byte, ids []U
 	}
 	var uncached []uncachedEntry
 	for i, id := range ids {
-		if eng, found := ps.cache.Get(wsPrefix, id); found {
+		var eng *Engram
+		var found bool
+		if passive {
+			eng, found = ps.cache.Peek(wsPrefix, id)
+		} else {
+			eng, found = ps.cache.Get(wsPrefix, id)
+		}
+		if found {
 			result[i] = eng
 		} else {
 			uncached = append(uncached, uncachedEntry{
@@ -144,7 +163,9 @@ func (ps *PebbleStore) GetEngrams(ctx context.Context, wsPrefix [8]byte, ids []U
 			continue
 		}
 		eng := fromERFEngram(erfEng)
-		ps.cache.Set(wsPrefix, u.id, eng)
+		if !passive {
+			ps.cache.Set(wsPrefix, u.id, eng)
+		}
 		result[u.resultIdx] = eng
 	}
 
@@ -159,13 +180,20 @@ func (ps *PebbleStore) GetMetadata(ctx context.Context, wsPrefix [8]byte, ids []
 	result := make([]*EngramMeta, len(ids))
 	for i, id := range ids {
 		// Level 1: metadata-only cache (populated after first Pebble read).
-		if meta, ok := ps.metaCache.Get([16]byte(id)); ok {
+		if meta, ok := ps.metaCache.Get(metaCacheKey(wsPrefix, id)); ok {
 			result[i] = meta
 			continue
 		}
 
 		// Level 2: full engram L1 cache — extract metadata fields without Pebble read.
-		if eng, found := ps.cache.Get(wsPrefix, id); found {
+		var eng *Engram
+		var found bool
+		if passiveReadsFromContext(ctx) {
+			eng, found = ps.cache.Peek(wsPrefix, id)
+		} else {
+			eng, found = ps.cache.Get(wsPrefix, id)
+		}
+		if found {
 			meta := &EngramMeta{
 				ID:          eng.ID,
 				CreatedAt:   eng.CreatedAt,
@@ -180,7 +208,7 @@ func (ps *PebbleStore) GetMetadata(ctx context.Context, wsPrefix [8]byte, ids []
 				EmbedDim:    eng.EmbedDim,
 				MemoryType:  eng.MemoryType,
 			}
-			ps.metaCache.Add([16]byte(id), meta)
+			ps.metaCache.Add(metaCacheKey(wsPrefix, id), meta)
 			result[i] = meta
 			continue
 		}
@@ -219,7 +247,7 @@ func (ps *PebbleStore) GetMetadata(ctx context.Context, wsPrefix [8]byte, ids []
 			MemoryType:  MemoryType(erfMeta.MemoryType),
 		}
 		// Populate metaCache so subsequent calls for this engram skip Pebble.
-		ps.metaCache.Add([16]byte(id), meta)
+		ps.metaCache.Add(metaCacheKey(wsPrefix, id), meta)
 		result[i] = meta
 	}
 	return result, nil
@@ -281,7 +309,7 @@ func (ps *PebbleStore) UpdateMetadata(ctx context.Context, wsPrefix [8]byte, id 
 
 	// Invalidate L1 cache and metadata cache BEFORE commit — cached structs are stale.
 	ps.cache.Delete(wsPrefix, id)
-	ps.metaCache.Remove([16]byte(id))
+	ps.metaCache.Remove(metaCacheKey(wsPrefix, id))
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
@@ -354,7 +382,7 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 
 	// Invalidate L1 cache and metadata cache BEFORE commit — cached structs are stale.
 	ps.cache.Delete(wsPrefix, id)
-	ps.metaCache.Remove([16]byte(id))
+	ps.metaCache.Remove(metaCacheKey(wsPrefix, id))
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
@@ -613,7 +641,7 @@ func (ps *PebbleStore) SoftDelete(ctx context.Context, wsPrefix [8]byte, id ULID
 	// delete so that Restore can return the engram with its entity associations
 	// intact. Entity cleanup only happens on hard delete (DeleteEngram).
 	ps.cache.Set(wsPrefix, id, eng)
-	ps.metaCache.Remove([16]byte(id))
+	ps.metaCache.Remove(metaCacheKey(wsPrefix, id))
 
 	return nil
 }
@@ -657,7 +685,7 @@ func (ps *PebbleStore) UpdateTags(ctx context.Context, wsPrefix [8]byte, id ULID
 
 	// Invalidate L1 cache BEFORE commit — cached struct has stale tags.
 	ps.cache.Delete(wsPrefix, id)
-	ps.metaCache.Remove([16]byte(id))
+	ps.metaCache.Remove(metaCacheKey(wsPrefix, id))
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
@@ -745,7 +773,7 @@ func (ps *PebbleStore) UpdateConfidence(ctx context.Context, wsPrefix [8]byte, i
 	// Update cache (vault-scoped).
 	ps.cache.Set(wsPrefix, id, eng)
 	// Invalidate metadata cache — cached metadata is stale.
-	ps.metaCache.Remove([16]byte(id))
+	ps.metaCache.Remove(metaCacheKey(wsPrefix, id))
 
 	return nil
 }

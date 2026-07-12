@@ -14,7 +14,7 @@ import (
 // Vault is resolved from ?vault= query param first, then from JSON request bodies
 // on body-based routes, and finally defaults to "default" when no explicit
 // vault is provided.
-// Public vaults allow unauthenticated access in observe mode.
+// Public vaults allow unauthenticated access in full mode.
 // If a Bearer token is present, it is always validated regardless of vault visibility.
 func (s *Store) VaultAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +47,7 @@ func (s *Store) VaultAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			ctx := context.WithValue(r.Context(), ContextVault, key.Vault)
 			ctx = context.WithValue(ctx, ContextMode, key.Mode)
 			ctx = context.WithValue(ctx, ContextAPIKey, &key)
+			ctx = context.WithValue(ctx, ContextPrincipal, PrincipalAPIKey)
 			next(w, r.WithContext(ctx))
 			return
 		}
@@ -64,7 +65,8 @@ func (s *Store) VaultAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		ctx := context.WithValue(r.Context(), ContextVault, vault)
-		ctx = context.WithValue(ctx, ContextMode, ModeObserve)
+		ctx = context.WithValue(ctx, ContextMode, ModeFull)
+		ctx = context.WithValue(ctx, ContextPrincipal, PrincipalPublic)
 		next(w, r.WithContext(ctx))
 	}
 }
@@ -73,12 +75,12 @@ func (s *Store) VaultAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // Redirects to /login on failure — suitable for browser-facing UI routes.
 func AdminSessionMiddleware(secret []byte, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("muninn_session")
-		if err != nil || !validateSessionToken(cookie.Value, secret) {
+		if !HasValidAdminSession(r, secret) {
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return
 		}
-		next(w, r)
+		ctx := context.WithValue(r.Context(), ContextPrincipal, PrincipalAdmin)
+		next(w, r.WithContext(ctx))
 	}
 }
 
@@ -86,8 +88,7 @@ func AdminSessionMiddleware(secret []byte, next http.HandlerFunc) http.HandlerFu
 // Returns JSON 401 on failure — suitable for REST API admin routes.
 func (s *Store) AdminAPIMiddleware(secret []byte, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("muninn_session")
-		if err != nil || !validateSessionToken(cookie.Value, secret) {
+		if !HasValidAdminSession(r, secret) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"error":{"code":"AUTH_FAILED","message":"admin session required"}}`))
@@ -98,6 +99,7 @@ func (s *Store) AdminAPIMiddleware(secret []byte, next http.HandlerFunc) http.Ha
 			vault = "default"
 		}
 		ctx := context.WithValue(r.Context(), ContextVault, vault)
+		ctx = context.WithValue(ctx, ContextPrincipal, PrincipalAdmin)
 		next(w, r.WithContext(ctx))
 	}
 }
@@ -109,14 +111,14 @@ func (s *Store) AdminAPIMiddleware(secret []byte, next http.HandlerFunc) http.Ha
 func (s *Store) VaultAuthWithAdminBypass(secret []byte, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Admin session bypass — authenticated Web UI gets full access to any vault.
-		cookie, err := r.Cookie("muninn_session")
-		if err == nil && validateSessionToken(cookie.Value, secret) {
+		if HasValidAdminSession(r, secret) {
 			vault := r.URL.Query().Get("vault")
 			if vault == "" {
 				vault = "default"
 			}
 			ctx := context.WithValue(r.Context(), ContextVault, vault)
 			ctx = context.WithValue(ctx, ContextMode, ModeFull)
+			ctx = context.WithValue(ctx, ContextPrincipal, PrincipalAdmin)
 			next(w, r.WithContext(ctx))
 			return
 		}
@@ -125,11 +127,23 @@ func (s *Store) VaultAuthWithAdminBypass(secret []byte, next http.HandlerFunc) h
 	}
 }
 
+// HasValidAdminSession reports whether r carries a currently valid signed admin
+// session cookie. Long-lived handlers should call it again over time rather than
+// treating the request-start result as permanent authorization.
+func HasValidAdminSession(r *http.Request, secret []byte) bool {
+	if r == nil || len(secret) == 0 {
+		return false
+	}
+	cookie, err := r.Cookie("muninn_session")
+	return err == nil && validateSessionToken(cookie.Value, secret)
+}
+
 // Mode enforcement uses two layers — documented here for future reference:
 //
 //   "observe" mode — engine-layer enforcement: reads are allowed but cognitive
 //   mutations (Hebbian associations, predictive activation) are suppressed via
-//   ObserveFromContext. The engine decides what to skip.
+//   ObserveFromContext. ReadOnlyGuard additionally blocks semantically mutating
+//   REST routes so observe keys stay read-only at the API surface too.
 //
 //   "write" mode (ingest-only) — middleware-layer enforcement: read endpoints
 //   return 403 before the engine is called at all. WriteOnlyGuard is applied at
@@ -162,6 +176,27 @@ func WriteOnlyGuard(next http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			w.Write([]byte(`{"error":{"code":"FORBIDDEN","message":"write-only key cannot read"}}`))
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ReadOnlyFromContext returns true for request modes that must not call
+// semantically mutating operations. Transport wiring decides which endpoints
+// are mutating; do not infer this from the HTTP verb alone.
+func ReadOnlyFromContext(ctx context.Context) bool {
+	return ObserveFromContext(ctx)
+}
+
+// ReadOnlyGuard is HTTP middleware that returns 403 for read-only mode
+// requests when attached to semantically mutating endpoints.
+func ReadOnlyGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if ReadOnlyFromContext(r.Context()) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"code":"FORBIDDEN","message":"read-only key cannot write"}}`))
 			return
 		}
 		next(w, r)

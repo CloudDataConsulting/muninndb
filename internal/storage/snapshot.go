@@ -7,6 +7,7 @@ import (
 )
 
 type snapshotCtxKey struct{}
+type passiveReadCtxKey struct{}
 
 // ContextWithSnapshot returns a context carrying a Pebble snapshot.
 // PebbleStore read methods (GetEngrams, GetMetadata, GetAssociations,
@@ -15,6 +16,18 @@ type snapshotCtxKey struct{}
 // across the full activation pipeline.
 func ContextWithSnapshot(ctx context.Context, snap *pebble.Snapshot) context.Context {
 	return context.WithValue(ctx, snapshotCtxKey{}, snap)
+}
+
+// ContextWithPassiveReads marks storage reads as cognitively passive. Passive
+// reads may use existing cache entries but must not advance access timestamps
+// or populate the L1 cache with a synthetic "accessed now" timestamp.
+func ContextWithPassiveReads(ctx context.Context) context.Context {
+	return context.WithValue(ctx, passiveReadCtxKey{}, true)
+}
+
+func passiveReadsFromContext(ctx context.Context) bool {
+	passive, _ := ctx.Value(passiveReadCtxKey{}).(bool)
+	return passive
 }
 
 // pebbleReader returns the snapshot from ctx if present, otherwise the live DB.

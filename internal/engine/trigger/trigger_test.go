@@ -61,14 +61,14 @@ func (e *stubTrigEmbedder) Embed(_ context.Context, _ []string) ([]float32, erro
 // without going through TriggerSystem.Subscribe (which requires a live embedder).
 func newMinimalSub(id string, vaultID uint32, ttl time.Duration) *Subscription {
 	sub := &Subscription{
-		ID:          id,
-		VaultID:     vaultID,
-		Threshold:   0.0,
-		RateLimit:   10,
-		TTL:         ttl,
-		rateLimiter: newTokenBucket(10),
+		ID:           id,
+		Workspace:    testWorkspace(vaultID),
+		Threshold:    0.0,
+		RateLimit:    10,
+		TTL:          ttl,
+		rateLimiter:  newTokenBucket(10),
 		pushedScores: make(map[storage.ULID]float64),
-		createdAt:   time.Now(),
+		createdAt:    time.Now(),
 	}
 	if ttl > 0 {
 		sub.expiresAt = sub.createdAt.Add(ttl)
@@ -101,7 +101,7 @@ func TestSubscriptionRegistryAddRemove(t *testing.T) {
 	reg.Add(s2)
 	reg.Add(s3)
 
-	subs := reg.ForVault(1)
+	subs := reg.ForVault(testWorkspace(1))
 	if len(subs) != 3 {
 		t.Fatalf("ForVault returned %d subs, want 3", len(subs))
 	}
@@ -109,7 +109,7 @@ func TestSubscriptionRegistryAddRemove(t *testing.T) {
 	// Remove one.
 	reg.Remove("sub-2")
 
-	subs = reg.ForVault(1)
+	subs = reg.ForVault(testWorkspace(1))
 	if len(subs) != 2 {
 		t.Fatalf("ForVault after Remove returned %d subs, want 2", len(subs))
 	}
@@ -155,7 +155,7 @@ func TestSubscriptionRegistryPruneExpired(t *testing.T) {
 		t.Error("PruneExpired removed 0 subscriptions, expected >= 1")
 	}
 
-	remaining := reg.ForVault(99)
+	remaining := reg.ForVault(testWorkspace(99))
 	for _, s := range remaining {
 		if s.ID == "expiring" {
 			t.Error("expired subscription still present after PruneExpired")
@@ -292,7 +292,7 @@ func TestEmbedCacheMaxSize(t *testing.T) {
 	over := embedCacheMax + 10
 	for i := 0; i < over; i++ {
 		// Build a unique key per iteration.
-		key := []string{"key", string(rune(i/26+65)), string(rune(i%26+65)), "x"}
+		key := []string{"key", string(rune(i/26 + 65)), string(rune(i%26 + 65)), "x"}
 		cache.Set(key, []float32{float32(i)})
 	}
 
@@ -321,8 +321,8 @@ func TestTriggerSystemStartStop(t *testing.T) {
 
 	// Channel to detect when the worker goroutine exits.
 	done := make(chan struct{})
-	origRun := ts.worker.Run  // save reference for wrapping
-	_ = origRun               // not wrapping — we just time the cancel below
+	origRun := ts.worker.Run // save reference for wrapping
+	_ = origRun              // not wrapping — we just time the cancel below
 
 	ts.Start(ctx)
 
@@ -332,15 +332,15 @@ func TestTriggerSystemStartStop(t *testing.T) {
 
 	// Send a few events to make the worker do real work.
 	ts.WriteEvents <- &EngramEvent{
-		VaultID: 7,
-		Engram:  &storage.Engram{ID: storage.NewULID(), Confidence: 1.0},
-		IsNew:   true,
+		Workspace: testWorkspace(7),
+		Engram:    &storage.Engram{ID: storage.NewULID(), Confidence: 1.0},
+		IsNew:     true,
 	}
 
 	time.Sleep(10 * time.Millisecond)
 
 	// Verify the system is alive by checking the registry still has the sub.
-	subs := ts.registry.ForVault(7)
+	subs := ts.registry.ForVault(testWorkspace(7))
 	if len(subs) == 0 {
 		t.Error("expected subscription to persist while running")
 	}
@@ -398,7 +398,7 @@ func TestNotifyWriteDelivers(t *testing.T) {
 	// Register a subscription on vault 42 with PushOnWrite enabled and zero threshold.
 	sub := &Subscription{
 		ID:           "write-test",
-		VaultID:      42,
+		Workspace:    testWorkspace(42),
 		Threshold:    0.0,
 		PushOnWrite:  true,
 		RateLimit:    100,
@@ -419,7 +419,7 @@ func TestNotifyWriteDelivers(t *testing.T) {
 		Confidence: 0.9,
 		Embedding:  testVec,
 	}
-	ts.WriteEvents <- &EngramEvent{VaultID: 42, Engram: eng, IsNew: true}
+	ts.WriteEvents <- &EngramEvent{Workspace: testWorkspace(42), Engram: eng, IsNew: true}
 
 	select {
 	case push := <-received:
@@ -460,7 +460,7 @@ func TestSubscriptionRegistryConcurrentAccess(t *testing.T) {
 		go func(s *Subscription) {
 			defer wg.Done()
 			reg.Add(s)
-			_ = reg.ForVault(5)
+			_ = reg.ForVault(testWorkspace(5))
 			reg.Remove(s.ID)
 		}(sub)
 	}
@@ -486,8 +486,8 @@ func TestSubscribeVaultCapReturnsError(t *testing.T) {
 	// Add 2 subscriptions for vault 99 — must succeed.
 	for i := 0; i < 2; i++ {
 		sub := &Subscription{
-			ID:      "vault-cap-" + string(rune('0'+i)),
-			VaultID: 99,
+			ID:        "vault-cap-" + string(rune('0'+i)),
+			Workspace: testWorkspace(99),
 		}
 		if err := ts.Subscribe(sub); err != nil {
 			t.Fatalf("Subscribe[%d]: unexpected error: %v", i, err)
@@ -495,7 +495,7 @@ func TestSubscribeVaultCapReturnsError(t *testing.T) {
 	}
 
 	// Third subscription for vault 99 must fail with ErrVaultSubscriptionLimitReached.
-	sub := &Subscription{ID: "vault-cap-overflow", VaultID: 99}
+	sub := &Subscription{ID: "vault-cap-overflow", Workspace: testWorkspace(99)}
 	err := ts.Subscribe(sub)
 	if err == nil {
 		t.Fatal("expected ErrVaultSubscriptionLimitReached, got nil")
@@ -523,8 +523,8 @@ func TestSubscribeGlobalCapReturnsError(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		sub := &Subscription{
-			ID:      "global-cap-" + string(rune('0'+i)),
-			VaultID: uint32(i), // different vaults to bypass per-vault cap
+			ID:        "global-cap-" + string(rune('0'+i)),
+			Workspace: testWorkspace(uint32(i)), // different vaults to bypass per-vault cap
 		}
 		if err := ts.Subscribe(sub); err != nil {
 			t.Fatalf("Subscribe[%d]: unexpected error: %v", i, err)
@@ -532,7 +532,7 @@ func TestSubscribeGlobalCapReturnsError(t *testing.T) {
 	}
 
 	// Fourth subscription must fail with ErrGlobalSubscriptionLimitReached.
-	sub := &Subscription{ID: "global-cap-overflow", VaultID: 99}
+	sub := &Subscription{ID: "global-cap-overflow", Workspace: testWorkspace(99)}
 	err := ts.Subscribe(sub)
 	if err == nil {
 		t.Fatal("expected ErrGlobalSubscriptionLimitReached, got nil")
@@ -560,16 +560,16 @@ func TestSubscribeWithinCapSucceeds(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		sub := &Subscription{
-			ID:      "within-cap-" + string(rune('0'+i)),
-			VaultID: 7,
+			ID:        "within-cap-" + string(rune('0'+i)),
+			Workspace: testWorkspace(7),
 		}
 		if err := ts.Subscribe(sub); err != nil {
 			t.Errorf("Subscribe[%d] within cap failed: %v", i, err)
 		}
 	}
 
-	if ts.registry.CountForVault(7) != 5 {
-		t.Errorf("CountForVault = %d, want 5", ts.registry.CountForVault(7))
+	if ts.registry.CountForVault(testWorkspace(7)) != 5 {
+		t.Errorf("CountForVault = %d, want 5", ts.registry.CountForVault(testWorkspace(7)))
 	}
 }
 
@@ -592,19 +592,19 @@ func TestRegistryCountMethods(t *testing.T) {
 	reg.Add(s2)
 	reg.Add(s3)
 
-	if reg.CountForVault(10) != 2 {
-		t.Errorf("CountForVault(10) = %d, want 2", reg.CountForVault(10))
+	if reg.CountForVault(testWorkspace(10)) != 2 {
+		t.Errorf("CountForVault(10) = %d, want 2", reg.CountForVault(testWorkspace(10)))
 	}
-	if reg.CountForVault(20) != 1 {
-		t.Errorf("CountForVault(20) = %d, want 1", reg.CountForVault(20))
+	if reg.CountForVault(testWorkspace(20)) != 1 {
+		t.Errorf("CountForVault(20) = %d, want 1", reg.CountForVault(testWorkspace(20)))
 	}
 	if reg.CountTotal() != 3 {
 		t.Errorf("CountTotal = %d, want 3", reg.CountTotal())
 	}
 
 	reg.Remove("cnt-2")
-	if reg.CountForVault(10) != 1 {
-		t.Errorf("after Remove, CountForVault(10) = %d, want 1", reg.CountForVault(10))
+	if reg.CountForVault(testWorkspace(10)) != 1 {
+		t.Errorf("after Remove, CountForVault(10) = %d, want 1", reg.CountForVault(testWorkspace(10)))
 	}
 	if reg.CountTotal() != 2 {
 		t.Errorf("after Remove, CountTotal = %d, want 2", reg.CountTotal())
@@ -620,12 +620,12 @@ func TestNotifyCognitiveEnqueues(t *testing.T) {
 
 	id := storage.NewULID()
 	// Delta = 0.5 — above the 0.001 filter.
-	ts.NotifyCognitive(42, id, "association_weight", 0.1, 0.6)
+	ts.NotifyCognitive(testWorkspace(42), id, "association_weight", 0.1, 0.6)
 
 	select {
 	case ev := <-ts.CognitiveEvents:
-		if ev.VaultID != 42 {
-			t.Errorf("VaultID = %d, want 42", ev.VaultID)
+		if ev.Workspace != testWorkspace(42) {
+			t.Errorf("Workspace = %v, want %v", ev.Workspace, testWorkspace(42))
 		}
 		if ev.EngramID != id {
 			t.Errorf("EngramID mismatch")
@@ -653,7 +653,7 @@ func TestNotifyCognitiveSubThresholdDropped(t *testing.T) {
 
 	id := storage.NewULID()
 	// Delta = 0.0005 — below 0.001 filter → should NOT be enqueued.
-	ts.NotifyCognitive(1, id, "relevance", 0.5000, 0.5005)
+	ts.NotifyCognitive(testWorkspace(1), id, "relevance", 0.5000, 0.5005)
 
 	select {
 	case ev := <-ts.CognitiveEvents:
@@ -672,12 +672,12 @@ func TestNotifyContradictionEnqueues(t *testing.T) {
 
 	a := storage.NewULID()
 	b := storage.NewULID()
-	ts.NotifyContradiction(7, a, b, 0.85, "semantic")
+	ts.NotifyContradiction(testWorkspace(7), a, b, 0.85, "semantic")
 
 	select {
 	case ev := <-ts.ContradictEvents:
-		if ev.VaultID != 7 {
-			t.Errorf("VaultID = %d, want 7", ev.VaultID)
+		if ev.Workspace != testWorkspace(7) {
+			t.Errorf("Workspace = %v, want %v", ev.Workspace, testWorkspace(7))
 		}
 		if ev.EngramA != a {
 			t.Error("EngramA mismatch")
@@ -794,13 +794,13 @@ func TestUnsubscribeFreesCapacity(t *testing.T) {
 		},
 	)
 
-	sub1 := &Subscription{ID: "cap-free-1", VaultID: 55}
+	sub1 := &Subscription{ID: "cap-free-1", Workspace: testWorkspace(55)}
 	if err := ts.Subscribe(sub1); err != nil {
 		t.Fatalf("first Subscribe: %v", err)
 	}
 
 	// Second subscribe must fail — vault is at cap.
-	sub2 := &Subscription{ID: "cap-free-2", VaultID: 55}
+	sub2 := &Subscription{ID: "cap-free-2", Workspace: testWorkspace(55)}
 	if err := ts.Subscribe(sub2); err != ErrVaultSubscriptionLimitReached {
 		t.Fatalf("expected ErrVaultSubscriptionLimitReached, got %v", err)
 	}
@@ -809,7 +809,7 @@ func TestUnsubscribeFreesCapacity(t *testing.T) {
 	ts.Unsubscribe("cap-free-1")
 
 	// Third subscribe must now succeed.
-	sub3 := &Subscription{ID: "cap-free-3", VaultID: 55}
+	sub3 := &Subscription{ID: "cap-free-3", Workspace: testWorkspace(55)}
 	if err := ts.Subscribe(sub3); err != nil {
 		t.Errorf("Subscribe after Unsubscribe failed: %v", err)
 	}

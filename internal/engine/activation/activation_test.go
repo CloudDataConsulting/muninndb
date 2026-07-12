@@ -17,17 +17,20 @@ import (
 
 // stubStore implements activation.ActivationStore using in-memory maps.
 type stubStore struct {
-	engrams  map[storage.ULID]*storage.Engram
-	metas    map[storage.ULID]*storage.EngramMeta
-	assocs   map[storage.ULID][]storage.Association
-	recent   []storage.ULID
+	engrams         map[storage.ULID]*storage.Engram
+	metas           map[storage.ULID]*storage.EngramMeta
+	assocs          map[storage.ULID][]storage.Association
+	recent          []storage.ULID
+	archived        map[storage.ULID][]storage.ULID
+	archiveRestores int
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		engrams: make(map[storage.ULID]*storage.Engram),
-		metas:   make(map[storage.ULID]*storage.EngramMeta),
-		assocs:  make(map[storage.ULID][]storage.Association),
+		engrams:  make(map[storage.ULID]*storage.Engram),
+		metas:    make(map[storage.ULID]*storage.EngramMeta),
+		assocs:   make(map[storage.ULID][]storage.Association),
+		archived: make(map[storage.ULID][]storage.ULID),
 	}
 }
 
@@ -125,12 +128,13 @@ func (s *stubStore) EngramIDsByCreatedRange(_ context.Context, _ [8]byte, since,
 	return ids, nil
 }
 
-func (s *stubStore) RestoreArchivedEdgesTransitive(_ context.Context, _ [8]byte, _ storage.ULID, _, _ int) ([]storage.ULID, error) {
-	return nil, nil
+func (s *stubStore) RestoreArchivedEdgesTransitive(_ context.Context, _ [8]byte, id storage.ULID, _, _ int) ([]storage.ULID, error) {
+	s.archiveRestores++
+	return append([]storage.ULID(nil), s.archived[id]...), nil
 }
 
-func (s *stubStore) ArchiveBloomMayContain(_ [16]byte) bool {
-	return false
+func (s *stubStore) ArchiveBloomMayContain(id [16]byte) bool {
+	return len(s.archived[storage.ULID(id)]) > 0
 }
 
 // stubFTS implements activation.FTSIndex using a fixed scored list.
@@ -643,6 +647,62 @@ func TestReadOnlySkipsActivationLog(t *testing.T) {
 	// result from ReadOnly mode must have the same top engram as normal mode.
 	if result.Activations[0].Engram.ID != eng1.ID {
 		t.Errorf("ReadOnly activation returned wrong engram: %v", result.Activations[0].Engram.Concept)
+	}
+}
+
+func TestReadOnlySkipsArchiveRestore(t *testing.T) {
+	store := newStubStore()
+	seed := &storage.Engram{
+		Concept:    "archived seed",
+		Content:    "seed with a dormant archived association",
+		Confidence: 1.0,
+		Stability:  30.0,
+		Relevance:  0.8,
+	}
+	target := &storage.Engram{
+		Concept:    "archived target",
+		Content:    "target of the dormant association",
+		Confidence: 1.0,
+		Stability:  30.0,
+		Relevance:  0.7,
+	}
+	store.writeEngram(seed)
+	store.writeEngram(target)
+	store.archived[seed.ID] = []storage.ULID{target.ID}
+
+	fts := &stubFTS{results: []activation.ScoredID{{ID: seed.ID, Score: 0.9}}}
+	eng := newTestEngine(store, fts, nil)
+
+	readOnlyResult, err := eng.Run(context.Background(), &activation.ActivateRequest{
+		Context:    []string{"archived seed"},
+		Threshold:  0.0,
+		MaxResults: 5,
+		ReadOnly:   true,
+	})
+	if err != nil {
+		t.Fatalf("Run (ReadOnly): %v", err)
+	}
+	if store.archiveRestores != 0 {
+		t.Fatalf("ReadOnly activation invoked archive restore %d times, want 0", store.archiveRestores)
+	}
+	if len(readOnlyResult.RestoredEdges) != 0 {
+		t.Fatalf("ReadOnly activation returned restored edges: %+v", readOnlyResult.RestoredEdges)
+	}
+
+	fullResult, err := eng.Run(context.Background(), &activation.ActivateRequest{
+		Context:    []string{"archived seed"},
+		Threshold:  0.0,
+		MaxResults: 5,
+		ReadOnly:   false,
+	})
+	if err != nil {
+		t.Fatalf("Run (full): %v", err)
+	}
+	if store.archiveRestores == 0 {
+		t.Fatal("full activation did not invoke archive restore")
+	}
+	if len(fullResult.RestoredEdges) == 0 {
+		t.Fatal("full activation returned no restored edges")
 	}
 }
 

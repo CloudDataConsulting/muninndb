@@ -76,6 +76,92 @@ func TestWriteOnlyGuard_PassesThrough(t *testing.T) {
 	}
 }
 
+func TestReadOnlyFromContext(t *testing.T) {
+	tests := []struct {
+		mode string
+		want bool
+	}{
+		{auth.ModeObserve, true},
+		{auth.ModeFull, false},
+		{auth.ModeWrite, false},
+		{"", false},
+	}
+
+	for _, tc := range tests {
+		ctx := context.WithValue(context.Background(), auth.ContextMode, tc.mode)
+		if got := auth.ReadOnlyFromContext(ctx); got != tc.want {
+			t.Errorf("mode=%q: ReadOnlyFromContext=%v, want %v", tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestReadOnlyGuard_BlocksObserve(t *testing.T) {
+	reached := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true })
+	handler := auth.ReadOnlyGuard(inner)
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx := context.WithValue(req.Context(), auth.ContextMode, auth.ModeObserve)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req.WithContext(ctx))
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+	if reached {
+		t.Error("inner handler should not be called for observe mode")
+	}
+	if got, want := w.Body.String(), `{"error":{"code":"FORBIDDEN","message":"read-only key cannot write"}}`; got != want {
+		t.Errorf("unexpected response body: got %q want %q", got, want)
+	}
+}
+
+func TestReadOnlyGuard_PassesThroughWritableModes(t *testing.T) {
+	for _, mode := range []string{auth.ModeFull, auth.ModeWrite, ""} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			reached := false
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reached = true
+				w.WriteHeader(http.StatusNoContent)
+			})
+			handler := auth.ReadOnlyGuard(inner)
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			if mode != "" {
+				req = req.WithContext(context.WithValue(req.Context(), auth.ContextMode, mode))
+			}
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if !reached || w.Code != http.StatusNoContent {
+				t.Errorf("mode=%q: expected pass-through, reached=%v status=%d", mode, reached, w.Code)
+			}
+		})
+	}
+}
+
+func TestModeGuards_UseConsistentErrorEnvelope(t *testing.T) {
+	readOnlyReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	readOnlyReq = readOnlyReq.WithContext(context.WithValue(readOnlyReq.Context(), auth.ContextMode, auth.ModeObserve))
+	readOnlyResp := httptest.NewRecorder()
+	auth.ReadOnlyGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("read-only inner handler should not run")
+	}))(readOnlyResp, readOnlyReq)
+
+	writeOnlyReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	writeOnlyReq = writeOnlyReq.WithContext(context.WithValue(writeOnlyReq.Context(), auth.ContextMode, auth.ModeWrite))
+	writeOnlyResp := httptest.NewRecorder()
+	auth.WriteOnlyGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("write-only inner handler should not run")
+	}))(writeOnlyResp, writeOnlyReq)
+
+	if got, want := readOnlyResp.Header().Get("Content-Type"), writeOnlyResp.Header().Get("Content-Type"); got != want {
+		t.Errorf("content-type mismatch: got %q want %q", got, want)
+	}
+	if got, want := readOnlyResp.Code, writeOnlyResp.Code; got != want {
+		t.Errorf("status mismatch: got %d want %d", got, want)
+	}
+}
+
 // Regression: after "write"→"full" change, admin session must still be able to read.
 func TestVaultAuthWithAdminBypass_SetsFullMode(t *testing.T) {
 	store := newTestStore(t)
@@ -119,7 +205,9 @@ func TestAuthMiddleware_PublicVaultNoKey(t *testing.T) {
 	// Unconfigured vaults now default to locked (fail-closed).
 	s.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true})
 
+	var capturedMode string
 	handler := s.VaultAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		capturedMode, _ = r.Context().Value(auth.ContextMode).(string)
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -129,6 +217,9 @@ func TestAuthMiddleware_PublicVaultNoKey(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("public vault no key: expected 200, got %d", w.Code)
+	}
+	if capturedMode != auth.ModeFull {
+		t.Errorf("public vault no key: expected mode %q, got %q", auth.ModeFull, capturedMode)
 	}
 }
 

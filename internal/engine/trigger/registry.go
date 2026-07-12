@@ -9,23 +9,23 @@ import (
 type SubscriptionRegistry struct {
 	mu         sync.RWMutex
 	byID       map[string]*Subscription
-	byVault    map[uint32][]*Subscription
-	vaultCount map[uint32]int // O(1) per-vault counter (T3)
-	totalCount int            // O(1) global counter (T3)
+	byVault    map[[8]byte][]*Subscription
+	vaultCount map[[8]byte]int // O(1) per-vault counter (T3)
+	totalCount int             // O(1) global counter (T3)
 }
 
 func newRegistry() *SubscriptionRegistry {
 	return &SubscriptionRegistry{
 		byID:       make(map[string]*Subscription),
-		byVault:    make(map[uint32][]*Subscription),
-		vaultCount: make(map[uint32]int),
+		byVault:    make(map[[8]byte][]*Subscription),
+		vaultCount: make(map[[8]byte]int),
 	}
 }
 
-// CountForVault returns the number of active subscriptions for vaultID (O(1), T3).
-func (r *SubscriptionRegistry) CountForVault(vaultID uint32) int {
+// CountForVault returns the number of active subscriptions for workspace (O(1), T3).
+func (r *SubscriptionRegistry) CountForVault(workspace [8]byte) int {
 	r.mu.RLock()
-	n := r.vaultCount[vaultID]
+	n := r.vaultCount[workspace]
 	r.mu.RUnlock()
 	return n
 }
@@ -38,13 +38,31 @@ func (r *SubscriptionRegistry) CountTotal() int {
 	return n
 }
 
-func (r *SubscriptionRegistry) Add(sub *Subscription) {
+func (r *SubscriptionRegistry) Add(sub *Subscription, limits ...int) error {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.byID[sub.ID]; exists {
+		return ErrDuplicateSubscriptionID
+	}
+	var maxPerVault, maxTotal int
+	if len(limits) > 0 {
+		maxPerVault = limits[0]
+	}
+	if len(limits) > 1 {
+		maxTotal = limits[1]
+	}
+	if maxTotal > 0 && r.totalCount >= maxTotal {
+		return ErrGlobalSubscriptionLimitReached
+	}
+	workspace := sub.Workspace
+	if maxPerVault > 0 && r.vaultCount[workspace] >= maxPerVault {
+		return ErrVaultSubscriptionLimitReached
+	}
 	r.byID[sub.ID] = sub
-	r.byVault[sub.VaultID] = append(r.byVault[sub.VaultID], sub)
-	r.vaultCount[sub.VaultID]++
+	r.byVault[workspace] = append(r.byVault[workspace], sub)
+	r.vaultCount[workspace]++
 	r.totalCount++
-	r.mu.Unlock()
+	return nil
 }
 
 func (r *SubscriptionRegistry) Remove(id string) {
@@ -54,19 +72,30 @@ func (r *SubscriptionRegistry) Remove(id string) {
 	if !ok {
 		return
 	}
+	r.removeLocked(sub)
+}
+
+func (r *SubscriptionRegistry) removeLocked(sub *Subscription) {
+	id := sub.ID
 	delete(r.byID, id)
-	subs := r.byVault[sub.VaultID]
+	workspace := sub.Workspace
+	subs := r.byVault[workspace]
 	for i, s := range subs {
-		if s.ID == id {
+		if s == sub {
 			subs[i] = subs[len(subs)-1]
 			subs[len(subs)-1] = nil
-			r.byVault[sub.VaultID] = subs[:len(subs)-1]
+			subs = subs[:len(subs)-1]
 			break
 		}
 	}
-	r.vaultCount[sub.VaultID]--
-	if r.vaultCount[sub.VaultID] == 0 {
-		delete(r.vaultCount, sub.VaultID)
+	if len(subs) == 0 {
+		delete(r.byVault, workspace)
+	} else {
+		r.byVault[workspace] = subs
+	}
+	r.vaultCount[workspace]--
+	if r.vaultCount[workspace] == 0 {
+		delete(r.vaultCount, workspace)
 	}
 	r.totalCount--
 }
@@ -78,9 +107,9 @@ func (r *SubscriptionRegistry) Get(id string) (*Subscription, bool) {
 	return sub, ok
 }
 
-func (r *SubscriptionRegistry) ForVault(vaultID uint32) []*Subscription {
+func (r *SubscriptionRegistry) ForVault(workspace [8]byte) []*Subscription {
 	r.mu.RLock()
-	subs := r.byVault[vaultID]
+	subs := r.byVault[workspace]
 	if len(subs) == 0 {
 		r.mu.RUnlock()
 		return nil
@@ -91,11 +120,11 @@ func (r *SubscriptionRegistry) ForVault(vaultID uint32) []*Subscription {
 	return snapshot
 }
 
-func (r *SubscriptionRegistry) ActiveVaults() []uint32 {
+func (r *SubscriptionRegistry) ActiveVaults() [][8]byte {
 	r.mu.RLock()
-	vaults := make([]uint32, 0, len(r.byVault))
-	for v := range r.byVault {
-		vaults = append(vaults, v)
+	vaults := make([][8]byte, 0, len(r.byVault))
+	for workspace := range r.byVault {
+		vaults = append(vaults, workspace)
 	}
 	r.mu.RUnlock()
 	return vaults
@@ -103,16 +132,14 @@ func (r *SubscriptionRegistry) ActiveVaults() []uint32 {
 
 func (r *SubscriptionRegistry) PruneExpired() int {
 	now := time.Now()
-	var expired []string
-	r.mu.RLock()
-	for id, sub := range r.byID {
+	pruned := 0
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, sub := range r.byID {
 		if !sub.expiresAt.IsZero() && now.After(sub.expiresAt) {
-			expired = append(expired, id)
+			r.removeLocked(sub)
+			pruned++
 		}
 	}
-	r.mu.RUnlock()
-	for _, id := range expired {
-		r.Remove(id)
-	}
-	return len(expired)
+	return pruned
 }

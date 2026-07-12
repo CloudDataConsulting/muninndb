@@ -175,7 +175,7 @@ func (ps *PebbleStore) UpdateEmbedding(ctx context.Context, wsPrefix [8]byte, id
 				batch.Set(metaKey, erf.MetaKeySlice(buf), nil)
 				// Invalidate both caches so the next read re-fetches from Pebble.
 				ps.cache.Delete(wsPrefix, id)
-				ps.metaCache.Remove([16]byte(id))
+				ps.metaCache.Remove(metaCacheKey(wsPrefix, id))
 			}
 		}
 		// If the ERF record doesn't exist (race), skip — WriteEngram will set it.

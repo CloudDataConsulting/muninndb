@@ -35,6 +35,8 @@ import (
 // through the middleware chain to sendError.
 type ctxKeyRequestID struct{}
 
+const defaultSubscriptionAuthorizationInterval = time.Second
+
 // statusRecorder wraps http.ResponseWriter to capture the HTTP status code
 // written by downstream handlers for use in metrics instrumentation.
 type statusRecorder struct {
@@ -45,6 +47,20 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Flush preserves http.Flusher through loggingMiddleware so SSE handlers can
+// send frames as they are produced.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the network writer and clear the
+// server's normal write deadline for a long-lived SSE stream.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 // Server is an HTTP REST server for the MuninnDB engine.
@@ -94,6 +110,10 @@ type Server struct {
 	ready     chan struct{} // closed by Serve after wg.Add(1); guards against Shutdown racing wg.Wait
 	wg        sync.WaitGroup
 	shutdownM sync.Mutex
+
+	// Long-lived SSE streams periodically revalidate the exact principal that
+	// opened them. Tests may shorten this interval; production uses the default.
+	subscriptionAuthorizationInterval time.Duration
 }
 
 // EmbedInfo carries static embedder metadata set at server construction time.
@@ -140,6 +160,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 		shutdown:                 make(chan struct{}),
 		ready:                    make(chan struct{}),
 	}
+	s.subscriptionAuthorizationInterval = defaultSubscriptionAuthorizationInterval
 	// Subsystems are considered ready immediately unless explicitly marked otherwise.
 	s.subsystemsReady.Store(true)
 	if len(mcpInfo) > 0 {
@@ -168,12 +189,12 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("GET /api/workers", s.withPublicMiddleware(s.handleWorkerStats))
 
 	// Authenticated vault routes — require Bearer API key.
-	mux.HandleFunc("POST /api/engrams/batch", s.withMiddleware(s.handleBatchCreate))
-	mux.HandleFunc("POST /api/engrams", s.withMiddleware(s.handleCreateEngram))
+	mux.HandleFunc("POST /api/engrams/batch", s.withMiddleware(auth.ReadOnlyGuard(s.handleBatchCreate)))
+	mux.HandleFunc("POST /api/engrams", s.withMiddleware(auth.ReadOnlyGuard(s.handleCreateEngram)))
 	mux.HandleFunc("GET /api/engrams/{id}", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetEngram)))
-	mux.HandleFunc("DELETE /api/engrams/{id}", s.withMiddleware(s.handleDeleteEngram))
+	mux.HandleFunc("DELETE /api/engrams/{id}", s.withMiddleware(auth.ReadOnlyGuard(s.handleDeleteEngram)))
 	mux.HandleFunc("POST /api/activate", s.withMiddleware(auth.WriteOnlyGuard(s.handleActivate)))
-	mux.HandleFunc("POST /api/link", s.withMiddleware(s.handleLink))
+	mux.HandleFunc("POST /api/link", s.withMiddleware(auth.ReadOnlyGuard(s.handleLink)))
 	mux.HandleFunc("GET /api/stats", s.withMiddleware(auth.WriteOnlyGuard(s.handleStats)))
 	mux.HandleFunc("GET /api/engrams", s.withMiddleware(auth.WriteOnlyGuard(s.handleListEngrams)))
 	mux.HandleFunc("GET /api/engrams/{id}/links", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetEngramLinks)))
@@ -188,16 +209,16 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	// These POST operations mutate existing engrams and return engram data in
 	// their response body — write-only keys must not be able to extract vault
 	// data via any response path.
-	mux.HandleFunc("POST /api/engrams/{id}/evolve", s.withMiddleware(auth.WriteOnlyGuard(s.handleEvolve)))
-	mux.HandleFunc("POST /api/consolidate", s.withMiddleware(auth.WriteOnlyGuard(s.handleConsolidateEngrams)))
-	mux.HandleFunc("POST /api/decide", s.withMiddleware(auth.WriteOnlyGuard(s.handleDecide)))
-	mux.HandleFunc("POST /api/engrams/{id}/restore", s.withMiddleware(auth.WriteOnlyGuard(s.handleRestore)))
+	mux.HandleFunc("POST /api/engrams/{id}/evolve", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleEvolve))))
+	mux.HandleFunc("POST /api/consolidate", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleConsolidateEngrams))))
+	mux.HandleFunc("POST /api/decide", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleDecide))))
+	mux.HandleFunc("POST /api/engrams/{id}/restore", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleRestore))))
 	mux.HandleFunc("POST /api/traverse", s.withMiddleware(auth.WriteOnlyGuard(s.handleTraverse)))
 	mux.HandleFunc("POST /api/explain", s.withMiddleware(auth.WriteOnlyGuard(s.handleExplain)))
-	mux.HandleFunc("PUT /api/engrams/{id}/state", s.withMiddleware(s.handleSetState))
-	mux.HandleFunc("PUT /api/engrams/{id}/tags", s.withMiddleware(s.handleUpdateTags))
+	mux.HandleFunc("PUT /api/engrams/{id}/state", s.withMiddleware(auth.ReadOnlyGuard(s.handleSetState)))
+	mux.HandleFunc("PUT /api/engrams/{id}/tags", s.withMiddleware(auth.ReadOnlyGuard(s.handleUpdateTags)))
 	mux.HandleFunc("GET /api/deleted", s.withMiddleware(auth.WriteOnlyGuard(s.handleListDeleted)))
-	mux.HandleFunc("POST /api/engrams/{id}/retry-enrich", s.withMiddleware(auth.WriteOnlyGuard(s.handleRetryEnrich)))
+	mux.HandleFunc("POST /api/engrams/{id}/retry-enrich", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleRetryEnrich))))
 	mux.HandleFunc("GET /api/contradictions", s.withMiddleware(auth.WriteOnlyGuard(s.handleContradictions)))
 	mux.HandleFunc("GET /api/guide", s.withMiddleware(auth.WriteOnlyGuard(s.handleGuide)))
 
@@ -1197,6 +1218,15 @@ func (s *Server) handleBatchGetEngramLinks(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleListVaults(w http.ResponseWriter, r *http.Request) {
+	// Vault API keys and anonymous public callers are authorized for exactly the
+	// resolved request vault. Only a currently valid admin session may enumerate
+	// the complete engine/config vault set.
+	isAdmin := auth.PrincipalFromContext(r.Context()) == auth.PrincipalAdmin && auth.HasValidAdminSession(r, s.sessionSecret)
+	if s.authStore != nil && !isAdmin {
+		s.sendJSON(w, http.StatusOK, []string{ctxVault(r)})
+		return
+	}
+
 	vaults, err := s.engine.ListVaults(r.Context())
 	if err != nil {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
@@ -1566,6 +1596,54 @@ func (s *Server) handleGuide(w http.ResponseWriter, r *http.Request) {
 	s.sendJSON(w, http.StatusOK, GuideResponse{Guide: guide})
 }
 
+// subscriptionAuthorizationCheck captures the exact principal that opened an
+// SSE stream and returns a validator for subsequent delivery/idle checks. An
+// explicit credential never falls back to public access after it expires or is
+// revoked; likewise, an expired admin session does not downgrade to public.
+func (s *Server) subscriptionAuthorizationCheck(r *http.Request, vault, mode string) func() error {
+	if s.authStore == nil {
+		return func() error { return nil }
+	}
+
+	switch auth.PrincipalFromContext(r.Context()) {
+	case auth.PrincipalAdmin:
+		return func() error {
+			if !auth.HasValidAdminSession(r, s.sessionSecret) {
+				return errors.New("admin session is no longer valid")
+			}
+			return nil
+		}
+	case auth.PrincipalAPIKey:
+		authHeader := r.Header.Get("Authorization")
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		return func() error {
+			key, err := s.authStore.ValidateAPIKey(token)
+			if err != nil {
+				return fmt.Errorf("api key is no longer valid: %w", err)
+			}
+			if key.Vault != vault || key.Mode != mode {
+				return errors.New("api key authorization changed")
+			}
+			return nil
+		}
+	case auth.PrincipalPublic:
+		return func() error {
+			cfg, err := s.authStore.GetVaultConfig(vault)
+			if err != nil {
+				return fmt.Errorf("read public vault policy: %w", err)
+			}
+			if !cfg.Public {
+				return errors.New("public vault is now locked")
+			}
+			return nil
+		}
+	default:
+		return func() error {
+			return errors.New("subscription principal is missing")
+		}
+	}
+}
+
 // handleSubscribe opens a long-lived SSE connection. The client receives
 // ActivationPush events as JSON-encoded server-sent events.
 //
@@ -1579,12 +1657,19 @@ func (s *Server) handleGuide(w http.ResponseWriter, r *http.Request) {
 //	context   — (repeatable) subscription context strings for semantic matching
 //	threshold — float32 score threshold, default 0.5
 //	on_write  — "true"|"1" to receive a push on every qualifying write
+//	            alias: "push_on_write" (used by the SDKs)
 //	ttl       — subscription TTL in seconds, 0 = no expiry
 //	rate      — max pushes/sec, default 10
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	vault := ctxVault(r)
+	mode, _ := r.Context().Value(auth.ContextMode).(string)
+	authorize := s.subscriptionAuthorizationCheck(r, vault, mode)
+	if err := authorize(); err != nil {
+		s.sendError(r, w, http.StatusUnauthorized, ErrAuthFailed, "subscription authorization is no longer valid")
+		return
+	}
 	contextStrs := q["context"]
 
 	threshold := float32(0.5)
@@ -1616,7 +1701,11 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	} else if rateLimit > 1000 {
 		rateLimit = 1000
 	}
-	pushOnWrite := q.Get("on_write") == "true" || q.Get("on_write") == "1"
+	pushOnWriteParam := func(name string) bool {
+		value := q.Get(name)
+		return value == "true" || value == "1"
+	}
+	pushOnWrite := pushOnWriteParam("on_write") || pushOnWriteParam("push_on_write")
 
 	// Set SSE headers before any write to the body.
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -1644,8 +1733,17 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	// (deliver puts into pushCh; the SSE loop drains it), but deliver may be
 	// called from any goroutine, so we use an atomic for safety.
 	var consecutiveDrops int64
+	authorizationFailed := make(chan struct{})
+	var authorizationFailedOnce sync.Once
+	failAuthorization := func() {
+		authorizationFailedOnce.Do(func() { close(authorizationFailed) })
+	}
 
 	deliver := func(ctx context.Context, push *trigger.ActivationPush) error {
+		if err := authorize(); err != nil {
+			failAuthorization()
+			return err
+		}
 		select {
 		case pushCh <- push:
 			// Successful delivery — reset consecutive drop counter.
@@ -1685,6 +1783,9 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		s.engine.Unsubscribe(ctx, subID)
 	}()
+	if err := authorize(); err != nil {
+		return
+	}
 
 	// Confirm subscription to client.
 	fmt.Fprintf(w, "event: subscribed\ndata: {\"id\":%q}\n\n", subID)
@@ -1692,16 +1793,34 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 
 	ping := time.NewTicker(30 * time.Second)
 	defer ping.Stop()
+	authorizationInterval := s.subscriptionAuthorizationInterval
+	if authorizationInterval <= 0 {
+		authorizationInterval = defaultSubscriptionAuthorizationInterval
+	}
+	authorizationTicker := time.NewTicker(authorizationInterval)
+	defer authorizationTicker.Stop()
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-authorizationFailed:
+			return
+		case <-authorizationTicker.C:
+			if err := authorize(); err != nil {
+				return
+			}
 		case <-ping.C:
+			if err := authorize(); err != nil {
+				return
+			}
 			fmt.Fprintf(w, "event: ping\ndata: {}\n\n")
 			flusher.Flush()
 		case push, ok := <-pushCh:
 			if !ok {
+				return
+			}
+			if err := authorize(); err != nil {
 				return
 			}
 			// T6: Check whether the deliver func has been dropping pushes for this

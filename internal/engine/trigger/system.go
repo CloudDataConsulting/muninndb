@@ -22,6 +22,7 @@ type TriggerConfig struct {
 var (
 	ErrVaultSubscriptionLimitReached  = errors.New("trigger: per-vault subscription limit reached")
 	ErrGlobalSubscriptionLimitReached = errors.New("trigger: global subscription limit reached")
+	ErrDuplicateSubscriptionID        = errors.New("trigger: subscription ID already active")
 )
 
 const (
@@ -61,7 +62,7 @@ type ActivationPush struct {
 // Subscription is one active context subscription.
 type Subscription struct {
 	ID             string
-	VaultID        uint32
+	Workspace      [8]byte
 	Context        []string
 	Threshold      float64
 	TTL            time.Duration
@@ -72,6 +73,14 @@ type Subscription struct {
 	// Deliver is the function called to push activations to this subscriber.
 	// Set this before calling TriggerSystem.Subscribe.
 	Deliver DeliverFunc
+
+	// RequestContext is an immutable, cancellation-detached copy of the
+	// authenticated subscribe context. Delivery derives bounded child contexts
+	// from it so vault/mode/principal values survive beyond the HTTP handler's
+	// request lifetime. PassiveReads controls storage access semantics for the
+	// worker without coupling the trigger package to auth mode constants.
+	RequestContext context.Context
+	PassiveReads   bool
 
 	// T6: circuit-breaker counters; read by the REST SSE handler to decide
 	// when to disconnect a slow subscriber.
@@ -90,28 +99,28 @@ type Subscription struct {
 
 // EngramEvent fires after every WRITE ACK.
 type EngramEvent struct {
-	VaultID uint32
-	Engram  *storage.Engram
-	IsNew   bool
+	Workspace [8]byte
+	Engram    *storage.Engram
+	IsNew     bool
 }
 
 // CognitiveEvent fires when a cognitive worker changes an engram's score.
 type CognitiveEvent struct {
-	VaultID  uint32
-	EngramID storage.ULID
-	Field    string
-	OldValue float32
-	NewValue float32
-	Delta    float32
+	Workspace [8]byte
+	EngramID  storage.ULID
+	Field     string
+	OldValue  float32
+	NewValue  float32
+	Delta     float32
 }
 
 // ContradictEvent fires when a contradiction is detected.
 type ContradictEvent struct {
-	VaultID  uint32
-	EngramA  storage.ULID
-	EngramB  storage.ULID
-	Severity float64
-	Type     string
+	Workspace [8]byte
+	EngramA   storage.ULID
+	EngramB   storage.ULID
+	Severity  float64
+	Type      string
 }
 
 // ScoredID is an index search result.
@@ -427,14 +436,6 @@ func (ts *TriggerSystem) Start(ctx context.Context) {
 
 // Subscribe adds a new subscription.
 func (ts *TriggerSystem) Subscribe(sub *Subscription) error {
-	// T3: enforce subscription caps before registering.
-	if ts.config.MaxTotalSubscriptions > 0 && ts.registry.CountTotal() >= ts.config.MaxTotalSubscriptions {
-		return ErrGlobalSubscriptionLimitReached
-	}
-	if ts.config.MaxSubscriptionsPerVault > 0 && ts.registry.CountForVault(sub.VaultID) >= ts.config.MaxSubscriptionsPerVault {
-		return ErrVaultSubscriptionLimitReached
-	}
-
 	if sub.RateLimit <= 0 {
 		sub.RateLimit = 10
 	}
@@ -458,8 +459,10 @@ func (ts *TriggerSystem) Subscribe(sub *Subscription) error {
 		}
 	}
 
-	ts.registry.Add(sub)
-	return nil
+	// Duplicate-ID rejection and both limits are checked under the registry's
+	// write lock so concurrent subscribers cannot orphan entries or race past
+	// their caps.
+	return ts.registry.Add(sub, ts.config.MaxSubscriptionsPerVault, ts.config.MaxTotalSubscriptions)
 }
 
 // Unsubscribe removes a subscription.
@@ -468,16 +471,16 @@ func (ts *TriggerSystem) Unsubscribe(id string) {
 }
 
 // NotifyWrite sends a write event to the trigger system.
-func (ts *TriggerSystem) NotifyWrite(vaultID uint32, eng *storage.Engram, isNew bool) {
+func (ts *TriggerSystem) NotifyWrite(workspace [8]byte, eng *storage.Engram, isNew bool) {
 	select {
-	case ts.WriteEvents <- &EngramEvent{VaultID: vaultID, Engram: eng, IsNew: isNew}:
+	case ts.WriteEvents <- &EngramEvent{Workspace: workspace, Engram: eng, IsNew: isNew}:
 	default:
 		// Drop — buffer full, sweep will catch it
 	}
 }
 
 // NotifyCognitive sends a cognitive change event.
-func (ts *TriggerSystem) NotifyCognitive(vaultID uint32, id storage.ULID, field string, old, new float32) {
+func (ts *TriggerSystem) NotifyCognitive(workspace [8]byte, id storage.ULID, field string, old, new float32) {
 	delta := new - old
 	if delta < 0 {
 		delta = -delta
@@ -486,15 +489,15 @@ func (ts *TriggerSystem) NotifyCognitive(vaultID uint32, id storage.ULID, field 
 		return
 	}
 	select {
-	case ts.CognitiveEvents <- CognitiveEvent{VaultID: vaultID, EngramID: id, Field: field, OldValue: old, NewValue: new, Delta: delta}:
+	case ts.CognitiveEvents <- CognitiveEvent{Workspace: workspace, EngramID: id, Field: field, OldValue: old, NewValue: new, Delta: delta}:
 	default:
 	}
 }
 
-// ForVault returns all active subscriptions for a given vault ID.
+// ForVault returns all active subscriptions for an exact vault workspace.
 // Exposed for testing.
-func (ts *TriggerSystem) ForVault(vaultID uint32) []*Subscription {
-	return ts.registry.ForVault(vaultID)
+func (ts *TriggerSystem) ForVault(workspace [8]byte) []*Subscription {
+	return ts.registry.ForVault(workspace)
 }
 
 // PruneExpired removes TTL-expired subscriptions and returns the count removed.
@@ -504,9 +507,9 @@ func (ts *TriggerSystem) PruneExpired() int {
 }
 
 // NotifyContradiction sends a contradiction event.
-func (ts *TriggerSystem) NotifyContradiction(vaultID uint32, a, b storage.ULID, severity float64, typ string) {
+func (ts *TriggerSystem) NotifyContradiction(workspace [8]byte, a, b storage.ULID, severity float64, typ string) {
 	select {
-	case ts.ContradictEvents <- ContradictEvent{VaultID: vaultID, EngramA: a, EngramB: b, Severity: severity, Type: typ}:
+	case ts.ContradictEvents <- ContradictEvent{Workspace: workspace, EngramA: a, EngramB: b, Severity: severity, Type: typ}:
 	default:
 	}
 }

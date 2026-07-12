@@ -811,7 +811,7 @@ func (ps *PebbleStore) UpdateDigest(ctx context.Context, id ULID, summary string
 
 	// Invalidate caches before commit — cached structs are stale.
 	ps.cache.Delete(ws, id)
-	ps.metaCache.Remove([16]byte(id))
+	ps.metaCache.Remove(metaCacheKey(ws, id))
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("UpdateDigest: commit: %w", err)
