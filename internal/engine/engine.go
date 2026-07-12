@@ -712,14 +712,17 @@ func (e *Engine) Hello(ctx context.Context, req *mbp.HelloRequest) (*mbp.HelloRe
 	}
 
 	// Register the vault name so it appears in ListVaults even before the
-	// first engram is written (idempotent, cheap).
+	// first engram is written (idempotent, cheap). Observe-mode handshakes are
+	// read-only and must not create persistent vault metadata.
 	vaultName := req.Vault
 	if vaultName == "" {
 		vaultName = "default"
 	}
-	wsPrefix := e.store.ResolveVaultPrefix(vaultName)
-	if err := e.store.WriteVaultName(wsPrefix, vaultName); err != nil {
-		slog.Warn("engine: Hello: failed to persist vault name", "vault", vaultName, "err", err)
+	if !auth.ObserveFromContext(ctx) {
+		wsPrefix := e.store.ResolveVaultPrefix(vaultName)
+		if err := e.store.WriteVaultName(wsPrefix, vaultName); err != nil {
+			slog.Warn("engine: Hello: failed to persist vault name", "vault", vaultName, "err", err)
+		}
 	}
 
 	return &mbp.HelloResponse{

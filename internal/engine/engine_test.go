@@ -231,6 +231,27 @@ func TestHelloRegistersVault(t *testing.T) {
 	}
 }
 
+func TestHelloObserveModeDoesNotRegisterVault(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.WithValue(context.Background(), auth.ContextMode, auth.ModeObserve)
+
+	const vault = "observe-hello-must-not-persist"
+	if _, err := eng.Hello(ctx, &mbp.HelloRequest{Version: "1", Vault: vault}); err != nil {
+		t.Fatalf("Hello failed: %v", err)
+	}
+
+	vaults, err := eng.ListVaults(context.Background())
+	if err != nil {
+		t.Fatalf("ListVaults: %v", err)
+	}
+	for _, got := range vaults {
+		if got == vault {
+			t.Fatalf("observe-mode Hello persisted vault %q", vault)
+		}
+	}
+}
+
 // TestActivateReturnsResults is the primary regression test for the bug where
 // Activate always returned 0 results. It exercises the full engine pipeline:
 // Write → FTS index → Activate → BM25 scoring.
