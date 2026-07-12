@@ -17,7 +17,15 @@ document.addEventListener('alpine:init', () => {
     appVersion: '',
 
     // Dashboard
-    stats: { engramCount: 0, vaultCount: 0, storageBytes: 0, indexSize: 0 },
+    stats: {
+      engramCount: 0,
+      vaultCount: 0,
+      statsScope: 'unknown',
+      storageBytes: 0,
+      storageBytesAvailable: false,
+      indexSize: 0,
+      indexSizeAvailable: false,
+    },
     workerStats: [],
     liveFeed: [],
     _activityChart: null,
@@ -591,10 +599,13 @@ document.addEventListener('alpine:init', () => {
       try {
         const data = await this.apiCall('/api/stats?vault=' + encodeURIComponent(this.vault));
         this.stats = {
-          engramCount:  data.engram_count   || data.engramCount  || 0,
-          vaultCount:   data.vault_count    || data.vaultCount   || 0,
-          storageBytes: data.storage_bytes  || data.storageBytes || 0,
-          indexSize:    data.index_size     || data.indexSize    || 0,
+          engramCount:          data.engram_count ?? data.engramCount ?? 0,
+          vaultCount:           data.vault_count ?? data.vaultCount ?? 0,
+          statsScope:           data.stats_scope ?? data.statsScope ?? 'unknown',
+          storageBytes:         data.storage_bytes ?? data.storageBytes ?? 0,
+          storageBytesAvailable: data.storage_bytes_available ?? data.storageBytesAvailable ?? false,
+          indexSize:            data.index_size ?? data.indexSize ?? 0,
+          indexSizeAvailable:   data.index_size_available ?? data.indexSizeAvailable ?? false,
         };
       } catch (err) {
         this.addNotification('error', 'Stats: ' + err.message);

@@ -119,6 +119,49 @@ func TestImportDeduplication(t *testing.T) {
 	}
 }
 
+func TestImportPreservesExistingTargetCount(t *testing.T) {
+	src := openTestStore(t)
+	dst := openTestStore(t)
+	ctx := context.Background()
+	wsSource := src.VaultPrefix("import-count-source")
+	wsTarget := dst.VaultPrefix("import-count-target")
+
+	for i := 0; i < 3; i++ {
+		if _, err := src.WriteEngram(ctx, wsSource, &Engram{Concept: "import", Content: "fixture"}); err != nil {
+			t.Fatalf("WriteEngram source[%d]: %v", i, err)
+		}
+	}
+	var archive bytes.Buffer
+	if _, err := src.ExportVaultData(ctx, wsSource, "import-count-source", ExportOpts{}, &archive); err != nil {
+		t.Fatalf("ExportVaultData: %v", err)
+	}
+	if _, err := dst.WriteEngram(ctx, wsTarget, &Engram{
+		Concept: "existing target",
+		Content: "must remain in the maintained count",
+	}); err != nil {
+		t.Fatalf("WriteEngram target: %v", err)
+	}
+
+	result, err := dst.ImportVaultData(ctx, wsTarget, "import-count-target", ImportOpts{SkipCompatCheck: true}, bytes.NewReader(archive.Bytes()))
+	if err != nil {
+		t.Fatalf("ImportVaultData: %v", err)
+	}
+	if result.EngramCount != 3 {
+		t.Fatalf("imported count = %d, want 3", result.EngramCount)
+	}
+	maintained, err := dst.GetVaultCountChecked(ctx, wsTarget)
+	if err != nil {
+		t.Fatalf("maintained target count: %v", err)
+	}
+	canonical, err := dst.countEngramsForVault(ctx, wsTarget)
+	if err != nil {
+		t.Fatalf("canonical target count: %v", err)
+	}
+	if maintained != 4 || canonical != 4 {
+		t.Fatalf("target counts maintained=%d canonical=%d, want 4", maintained, canonical)
+	}
+}
+
 func TestExportEmptyVault(t *testing.T) {
 	src := openTestStore(t)
 	ctx := context.Background()
@@ -204,6 +247,58 @@ func TestImport_CorruptChecksum(t *testing.T) {
 	}
 	if len(engrams) != 0 {
 		t.Errorf("expected 0 engrams in chk-dst after corrupt import, got %d", len(engrams))
+	}
+}
+
+func TestImport_CorruptChecksumKeepsCommittedCounterExact(t *testing.T) {
+	ctx := context.Background()
+	src := openTestStore(t)
+	wsSource := src.VaultPrefix("partial-checksum-source")
+	items := make([]EngramBatchItem, 200)
+	for i := range items {
+		items[i] = EngramBatchItem{
+			WSPrefix: wsSource,
+			Engram: &Engram{
+				Concept: "partial checksum",
+				Content: "enough keys to force an early streaming commit",
+			},
+		}
+	}
+	_, writeErrs := src.WriteEngramBatch(ctx, items)
+	for i, err := range writeErrs {
+		if err != nil {
+			t.Fatalf("WriteEngramBatch[%d]: %v", i, err)
+		}
+	}
+
+	var exported bytes.Buffer
+	if _, err := src.ExportVaultData(ctx, wsSource, "partial-checksum-source", ExportOpts{}, &exported); err != nil {
+		t.Fatalf("ExportVaultData: %v", err)
+	}
+	tampered, err := tamperChecksum(exported.Bytes())
+	if err != nil {
+		t.Fatalf("tamperChecksum: %v", err)
+	}
+
+	dst := openTestStore(t)
+	wsTarget := dst.VaultPrefix("partial-checksum-target")
+	_, importErr := dst.ImportVaultData(ctx, wsTarget, "partial-checksum-target", ImportOpts{SkipCompatCheck: true}, bytes.NewReader(tampered))
+	if importErr == nil || !strings.Contains(importErr.Error(), "checksum") {
+		t.Fatalf("ImportVaultData error = %v, want checksum failure", importErr)
+	}
+	maintained, err := dst.GetVaultCountChecked(ctx, wsTarget)
+	if err != nil {
+		t.Fatalf("maintained target count: %v", err)
+	}
+	canonical, err := dst.countEngramsForVault(ctx, wsTarget)
+	if err != nil {
+		t.Fatalf("canonical target count: %v", err)
+	}
+	if canonical == 0 {
+		t.Fatal("fixture did not force a pre-checksum streaming commit")
+	}
+	if maintained != canonical {
+		t.Fatalf("partial import counts maintained=%d canonical=%d", maintained, canonical)
 	}
 }
 

@@ -131,12 +131,16 @@ class CoherenceResult:
 
 @dataclass
 class StatResponse:
-    """Response from stats endpoint."""
+    """Vault-scoped response from the stats endpoint."""
 
     engram_count: int
     vault_count: int
     storage_bytes: int
     coherence: dict[str, CoherenceResult] | None = None
+    stats_scope: str = "unknown"
+    storage_bytes_available: bool = False
+    index_size: int = 0
+    index_size_available: bool = False
 
 
 @dataclass

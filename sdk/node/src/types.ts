@@ -309,14 +309,38 @@ export interface ContradictionsResponse {
 
 export interface CoherenceResult {
   score: number;
+  orphan_ratio?: number;
+  contradiction_density?: number;
+  duplication_pressure?: number;
+  temporal_variance?: number;
+  total_engrams?: number;
+  /** Legacy coherence fields returned by older servers. */
   issues: string[];
+  contradictions?: number;
   [key: string]: unknown;
 }
 
+export type StatsScope = "vault" | "global" | "unknown";
+
 export interface StatsResponse {
-  vault: string;
-  total_engrams: number;
+  engram_count: number;
+  vault_count: number;
+  index_size: number;
+  storage_bytes: number;
+  stats_scope: StatsScope;
+  storage_bytes_available: boolean;
+  index_size_available: boolean;
+  /** Legacy single-coherence view retained for source compatibility. */
   coherence?: CoherenceResult;
+  /** Current global/admin coherence map; omitted for vault-scoped stats. */
+  coherence_by_vault?: Record<string, CoherenceResult>;
+  /** Legacy aliases retained for source and runtime compatibility. */
+  total_engrams: number;
+  total_vaults?: number | null;
+  total_links?: number;
+  active_engrams?: number;
+  deleted_engrams?: number;
+  vault: string;
   [key: string]: unknown;
 }
 

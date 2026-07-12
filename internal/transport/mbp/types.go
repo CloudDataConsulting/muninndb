@@ -313,11 +313,14 @@ type CoherenceResult struct {
 
 // StatResponse returns database stats.
 type StatResponse struct {
-	EngramCount     int64                      `msgpack:"engram_count"        json:"engram_count"`
-	VaultCount      int                        `msgpack:"vault_count"         json:"vault_count"`
-	IndexSize       int64                      `msgpack:"index_size"          json:"index_size"`
-	StorageBytes    int64                      `msgpack:"storage_bytes"       json:"storage_bytes"`
-	CoherenceScores map[string]CoherenceResult `msgpack:"coherence,omitempty" json:"coherence,omitempty"`
+	EngramCount           int64                      `msgpack:"engram_count" json:"engram_count"`
+	VaultCount            int                        `msgpack:"vault_count" json:"vault_count"`
+	IndexSize             int64                      `msgpack:"index_size" json:"index_size"`
+	StorageBytes          int64                      `msgpack:"storage_bytes" json:"storage_bytes"`
+	StatsScope            string                     `msgpack:"stats_scope" json:"stats_scope"`
+	StorageBytesAvailable bool                       `msgpack:"storage_bytes_available" json:"storage_bytes_available"`
+	IndexSizeAvailable    bool                       `msgpack:"index_size_available" json:"index_size_available"`
+	CoherenceScores       map[string]CoherenceResult `msgpack:"coherence,omitempty" json:"coherence,omitempty"`
 }
 
 // PingRequest is a keepalive probe.

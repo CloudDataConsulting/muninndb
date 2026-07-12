@@ -390,7 +390,12 @@ func (e *ActivationEngine) Run(ctx context.Context, req *ActivateRequest) (*Acti
 	}
 
 	// Phase 4.75: Lazy archive restore — check Bloom filter, restore dormant edges.
-	restoredEdges := e.phase4_75ArchiveRestore(ctx, ws, fused)
+	// Observe mode is a pure read, so it must not move archived edges back into
+	// the live association index.
+	var restoredEdges []mbp.EdgeRef
+	if !req.ReadOnly {
+		restoredEdges = e.phase4_75ArchiveRestore(ctx, ws, fused)
+	}
 
 	// Resolve traversal profile for Phase 5 and for audit logging.
 	// Always resolved so ProfileUsed is set on every activation, regardless of HopDepth.

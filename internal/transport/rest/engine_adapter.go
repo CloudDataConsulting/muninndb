@@ -99,19 +99,11 @@ func (w *RESTEngineWrapper) Forget(ctx context.Context, req *ForgetRequest) (*Fo
 }
 
 func (w *RESTEngineWrapper) Stat(ctx context.Context, req *StatRequest) (*StatResponse, error) {
-	resp, err := w.engine.Stat(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if w.hnswReg != nil {
-		if req.Vault != "" {
-			ws := w.engine.Store().ResolveVaultPrefix(req.Vault)
-			resp.IndexSize = w.hnswReg.VaultVectorBytes(ws)
-		} else {
-			resp.IndexSize = w.hnswReg.TotalVectorBytes()
-		}
-	}
-	return resp, nil
+	// VaultVectorBytes/TotalVectorBytes account for vector payload memory only;
+	// they are not a truthful persisted index-size measurement. Preserve the
+	// engine's explicit unavailable/zero contract until a complete scoped index
+	// metric exists.
+	return w.engine.Stat(ctx, req)
 }
 
 func (w *RESTEngineWrapper) ListEngrams(ctx context.Context, req *ListEngramsRequest) (*ListEngramsResponse, error) {

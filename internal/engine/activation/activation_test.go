@@ -1162,12 +1162,30 @@ func TestPhase4_75_ArchiveRestoreRunsDuringActivation(t *testing.T) {
 		t.Fatal("archive Bloom filter not set for engram A after DecayAssocWeights")
 	}
 
-	// Run activation. Phase 4.75 should detect the Bloom hit for engram A and
-	// call RestoreArchivedEdgesTransitive, writing A→B back into the live index.
+	// Read-only activation must leave the archived edge untouched. A subsequent
+	// normal activation should detect the Bloom hit and restore A→B.
 	ftsStub := &stubFTS{results: []activation.ScoredID{
 		{ID: engramA.ID, Score: 0.9},
 	}}
 	eng := activation.New(pstore, ftsStub, &emptyHNSW{}, &stubEmbedder{})
+
+	observeResult, err := eng.Run(ctx, &activation.ActivateRequest{
+		VaultPrefix: ws,
+		Context:     []string{"seed engram"},
+		Threshold:   0.0,
+		MaxResults:  20,
+		HopDepth:    1,
+		ReadOnly:    true,
+	})
+	if err != nil {
+		t.Fatalf("Run read-only: %v", err)
+	}
+	if len(observeResult.RestoredEdges) != 0 {
+		t.Fatalf("read-only activation restored %d archived edges, want none", len(observeResult.RestoredEdges))
+	}
+	if wObserved, err := pstore.GetAssocWeight(ctx, ws, engramA.ID, engramB.ID); err != nil || wObserved != 0 {
+		t.Fatalf("read-only activation changed archived A→B edge: weight=%v err=%v", wObserved, err)
+	}
 
 	result, err := eng.Run(ctx, &activation.ActivateRequest{
 		VaultPrefix: ws,

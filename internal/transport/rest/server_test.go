@@ -91,9 +91,11 @@ func (m *MockEngine) Forget(ctx context.Context, req *ForgetRequest) (*ForgetRes
 
 func (m *MockEngine) Stat(ctx context.Context, req *StatRequest) (*StatResponse, error) {
 	return &StatResponse{
-		EngramCount:  100,
-		VaultCount:   1,
-		StorageBytes: 1024000,
+		EngramCount:           100,
+		VaultCount:            1,
+		StatsScope:            "vault",
+		StorageBytesAvailable: false,
+		IndexSizeAvailable:    false,
 	}, nil
 }
 

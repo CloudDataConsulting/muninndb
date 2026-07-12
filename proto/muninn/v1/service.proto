@@ -100,6 +100,9 @@ message StatResponse {
   int64 storage_bytes = 2;
   int32 vault_count = 3;
   int64 index_size = 4;
+  string stats_scope = 5;
+  bool storage_bytes_available = 6;
+  bool index_size_available = 7;
 }
 
 message LinkRequest {

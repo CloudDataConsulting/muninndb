@@ -119,12 +119,19 @@ type CoherenceResult struct {
 	TotalEngrams           int     `json:"total_engrams"`
 }
 
-// StatsResponse represents the response from the stats endpoint.
+// StatsResponse represents the response from the stats endpoint. StatsScope is
+// "vault" or "global" on current servers and "unknown" when a legacy server
+// omits the field. Size values are meaningful only when their availability
+// flags are true.
 type StatsResponse struct {
-	EngramCount int                          `json:"engram_count"`
-	VaultCount  int                          `json:"vault_count"`
-	StorageBytes int                         `json:"storage_bytes"`
-	Coherence   map[string]CoherenceResult  `json:"coherence,omitempty"`
+	EngramCount           int                        `json:"engram_count"`
+	VaultCount            int                        `json:"vault_count"`
+	IndexSize             int64                      `json:"index_size"`
+	StorageBytes          int64                      `json:"storage_bytes"`
+	StatsScope            string                     `json:"stats_scope"`
+	StorageBytesAvailable bool                       `json:"storage_bytes_available"`
+	IndexSizeAvailable    bool                       `json:"index_size_available"`
+	Coherence             map[string]CoherenceResult `json:"coherence,omitempty"`
 }
 
 // LinkRequest represents a request to link two engrams.

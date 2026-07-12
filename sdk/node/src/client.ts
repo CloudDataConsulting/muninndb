@@ -11,6 +11,7 @@ import type {
   BatchWriteResponse,
   ConsolidateOptions,
   ConsolidateResponse,
+  CoherenceResult,
   ContradictionsResponse,
   DecideOptions,
   DecideResponse,
@@ -51,6 +52,36 @@ interface RequestOptions {
   query?: Record<string, string | number | boolean | undefined>;
   /** Skip automatic retry for this request. */
   noRetry?: boolean;
+}
+
+interface StatsWireResponse {
+  engram_count?: number;
+  vault_count?: number;
+  index_size?: number;
+  storage_bytes?: number;
+  stats_scope?: "vault" | "global" | "unknown";
+  storage_bytes_available?: boolean;
+  index_size_available?: boolean;
+  coherence?: CoherenceResult | Record<string, CoherenceResult>;
+  total_engrams?: number;
+  total_vaults?: number | null;
+  total_links?: number;
+  active_engrams?: number;
+  deleted_engrams?: number;
+  vault?: string;
+  [key: string]: unknown;
+}
+
+function normalizeCoherence(value: CoherenceResult): CoherenceResult {
+  return { ...value, issues: value.issues ?? [] };
+}
+
+function isCoherenceResult(value: unknown): value is CoherenceResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { score?: unknown }).score === "number"
+  );
 }
 
 /**
@@ -286,11 +317,43 @@ export class MuninnClient {
 
   /** Get vault statistics. */
   async stats(vault?: string): Promise<StatsResponse> {
-    return this.request<StatsResponse>({
+    const response = await this.request<StatsWireResponse>({
       method: "GET",
       path: "/api/stats",
       query: { vault: vault ?? this.defaultVault },
     });
+    const engramCount = response.engram_count ?? response.total_engrams ?? 0;
+    const vaultCount = response.vault_count ?? response.total_vaults ?? 0;
+    const resolvedVault = response.vault ?? vault ?? this.defaultVault;
+    let coherence: CoherenceResult | undefined;
+    let coherenceByVault: Record<string, CoherenceResult> | undefined;
+    if (isCoherenceResult(response.coherence)) {
+      coherence = normalizeCoherence(response.coherence);
+    } else if (response.coherence) {
+      coherenceByVault = {};
+      for (const [name, metrics] of Object.entries(response.coherence)) {
+        if (isCoherenceResult(metrics)) {
+          coherenceByVault[name] = normalizeCoherence(metrics);
+        }
+      }
+      coherence = Object.values(coherenceByVault)[0];
+    }
+    return {
+      ...response,
+      engram_count: engramCount,
+      vault_count: vaultCount,
+      index_size: response.index_size ?? 0,
+      storage_bytes: response.storage_bytes ?? 0,
+      stats_scope: response.stats_scope || "unknown",
+      storage_bytes_available: response.storage_bytes_available ?? false,
+      index_size_available: response.index_size_available ?? false,
+      // Preserve the properties exposed by pre-scoped-stats SDK releases.
+      total_engrams: response.total_engrams ?? engramCount,
+      vault: resolvedVault,
+      total_vaults: response.total_vaults ?? vaultCount,
+      coherence,
+      coherence_by_vault: coherenceByVault,
+    };
   }
 
   /** List engrams with pagination. */

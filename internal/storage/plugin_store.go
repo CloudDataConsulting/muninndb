@@ -137,6 +137,12 @@ func (ps *PebbleStore) getDigestFlagsRaw(id [16]byte) (uint8, error) {
 // For ERF v2, only the 0x18 embedding key is written; the full engram is not re-encoded.
 // It also patches EmbedDim in the ERF record so the UI reflects embedding status.
 func (ps *PebbleStore) UpdateEmbedding(ctx context.Context, wsPrefix [8]byte, id ULID, vec []float32) error {
+	unlockVault, err := ps.lockVaultCounterSet(ctx, [][8]byte{wsPrefix})
+	if err != nil {
+		return fmt.Errorf("update embedding: lock vault: %w", err)
+	}
+	defer unlockVault()
+
 	params, quantized := erf.Quantize(vec)
 	paramsBuf := erf.EncodeQuantizeParams(params)
 	embedBytes := make([]byte, 8+len(quantized))
@@ -148,6 +154,23 @@ func (ps *PebbleStore) UpdateEmbedding(ctx context.Context, wsPrefix [8]byte, id
 	batch := ps.db.NewBatch()
 	defer batch.Close()
 
+	// Read the canonical parent while holding the same vault lock used by
+	// ClearVault. If present, any 0x01 patch commits in the same serialized
+	// lifecycle transition. Missing canonical rows retain the legacy behavior of
+	// writing only the standalone embedding key.
+	erfKey := keys.EngramKey(wsPrefix, [16]byte(id))
+	val, closer, err := ps.db.Get(erfKey)
+	canonicalFound := err == nil
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return fmt.Errorf("update embedding: read engram: %w", err)
+	}
+	var buf []byte
+	if canonicalFound {
+		buf = make([]byte, len(val))
+		copy(buf, val)
+		closer.Close()
+	}
+
 	// Write the quantized embedding vector.
 	batch.Set(keys.EmbeddingKey(wsPrefix, [16]byte(id)), embedBytes, nil)
 
@@ -155,30 +178,21 @@ func (ps *PebbleStore) UpdateEmbedding(ctx context.Context, wsPrefix [8]byte, id
 	// EmbedDim lives at byte offset erf.OffsetEmbedDim (67) from the record start.
 	// PatchEmbedDim also recomputes the CRC32 trailer so the record stays valid.
 	dim := DimFromLen(len(vec))
-	if dim != types.EmbedNone {
-		erfKey := keys.EngramKey(wsPrefix, [16]byte(id))
-		val, closer, err := ps.db.Get(erfKey)
-		if err == nil {
-			buf := make([]byte, len(val))
-			copy(buf, val)
-			closer.Close()
-
-			if patchErr := erf.PatchEmbedDim(buf, uint8(dim)); patchErr != nil {
-				slog.Warn("UpdateEmbedding: failed to patch EmbedDim in ERF record",
-					"id", id,
-					"err", patchErr,
-				)
-			} else {
-				batch.Set(erfKey, buf, nil)
-				// Also update the 0x02 meta key so GetMetadata sees the new EmbedDim.
-				metaKey := keys.MetaKey(wsPrefix, [16]byte(id))
-				batch.Set(metaKey, erf.MetaKeySlice(buf), nil)
-				// Invalidate both caches so the next read re-fetches from Pebble.
-				ps.cache.Delete(wsPrefix, id)
-				ps.metaCache.Remove([16]byte(id))
-			}
+	if dim != types.EmbedNone && canonicalFound {
+		if patchErr := erf.PatchEmbedDim(buf, uint8(dim)); patchErr != nil {
+			slog.Warn("UpdateEmbedding: failed to patch EmbedDim in ERF record",
+				"id", id,
+				"err", patchErr,
+			)
+		} else {
+			batch.Set(erfKey, buf, nil)
+			// Also update the 0x02 meta key so GetMetadata sees the new EmbedDim.
+			metaKey := keys.MetaKey(wsPrefix, [16]byte(id))
+			batch.Set(metaKey, erf.MetaKeySlice(buf), nil)
+			// Invalidate both caches so the next read re-fetches from Pebble.
+			ps.cache.Delete(wsPrefix, id)
+			ps.metaCache.Remove([16]byte(id))
 		}
-		// If the ERF record doesn't exist (race), skip — WriteEngram will set it.
 	}
 
 	if err := batch.Commit(pebble.Sync); err != nil {

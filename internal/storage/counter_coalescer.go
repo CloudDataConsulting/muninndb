@@ -17,20 +17,28 @@ const counterFlushInterval = 100 * time.Millisecond
 // counterCoalescer replaces per-write goroutines for vault count persistence.
 // Submit is lock-free via sync.Map + atomic.Int64 — never drops updates.
 // The flusher sweeps the map every 100ms and writes to Pebble with NoSync.
-// The in-memory atomic is authoritative; last-write-wins is correct for a
-// monotonic counter. On crash, getOrInitCounter falls back to a full scan.
+// The in-memory atomic is authoritative. Production flushes share the vault
+// lock with inserts, deletes, and clears so the persisted last-write-wins value
+// cannot cross a canonical lifecycle transition. On process startup,
+// getOrInitCounter repairs it from a canonical per-vault scan.
 type counterCoalescer struct {
-	db   *pebble.DB
-	m    sync.Map // [8]byte → *atomic.Int64
-	stop chan struct{}
-	done chan struct{}
+	db        *pebble.DB
+	m         sync.Map // [8]byte → *atomic.Int64
+	stop      chan struct{}
+	done      chan struct{}
+	lockVault func([8]byte) func()
+	// beforeWriteHook is a deterministic test seam. Production leaves it nil.
+	beforeWriteHook func([8]byte, int64)
 }
 
-func newCounterCoalescer(db *pebble.DB) *counterCoalescer {
+func newCounterCoalescer(db *pebble.DB, lockers ...func([8]byte) func()) *counterCoalescer {
 	c := &counterCoalescer{
 		db:   db,
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
+	}
+	if len(lockers) > 0 {
+		c.lockVault = lockers[0]
 	}
 	go c.run()
 	return c
@@ -83,12 +91,27 @@ func (c *counterCoalescer) flush() {
 	var buf [8]byte
 	c.m.Range(func(k, v any) bool {
 		ws := k.([8]byte)
-		count := v.(*atomic.Int64).Load()
+		unlock := func() {}
+		if c.lockVault != nil {
+			unlock = c.lockVault(ws)
+		}
+		defer unlock()
+
+		counter := v.(*atomic.Int64)
+		count := counter.Load()
+		if c.beforeWriteHook != nil {
+			c.beforeWriteHook(ws, count)
+		}
 		binary.BigEndian.PutUint64(buf[:], uint64(count))
 		if err := c.db.Set(keys.VaultCountKey(ws), buf[:], pebble.NoSync); err != nil {
 			slog.Warn("storage: counter flush failed", "err", err)
 		}
-		c.m.Delete(ws)
+		// Do not erase a newer Submit that arrived while a standalone/test
+		// coalescer was flushing. Production Submit/Delete calls are additionally
+		// serialized by lockVault with Clear and canonical count transitions.
+		if counter.Load() == count {
+			c.m.CompareAndDelete(ws, counter)
+		}
 		return true
 	})
 }

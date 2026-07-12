@@ -64,4 +64,11 @@ $vaults = $client->listVaults();
 echo "\nVaults: " . implode(', ', $vaults) . "\n";
 
 $stats = $client->stats();
-echo "Total engrams: {$stats->totalEngrams}, links: {$stats->totalLinks}\n";
+echo "Stats ({$stats->statsScope} scope): {$stats->engramCount} engrams, "
+    . "{$stats->vaultCount} vaults in scope\n";
+echo $stats->storageBytesAvailable
+    ? "Storage bytes: {$stats->storageBytes}\n"
+    : "Storage bytes: unavailable for this scope\n";
+echo $stats->indexSizeAvailable
+    ? "Index size: {$stats->indexSize}\n"
+    : "Index size: unavailable for this scope\n";

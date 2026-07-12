@@ -113,6 +113,22 @@ const client = new MuninnClient({
 |--------|-------------|
 | `close()` | Abort all in-flight requests and subscriptions |
 
+`stats()` returns explicitly scoped counts. Check `stats_scope` before
+interpreting `vault_count`, and only use `storage_bytes` or `index_size` when
+the corresponding `*_available` flag is true. Legacy responses that omit the
+scope are normalized to `unknown`. Scoped coherence is intentionally omitted
+until its incremental registry is reconciled with canonical cardinality;
+optional coherence fields remain for legacy/global responses.
+
+```typescript
+const stats = await client.stats("work");
+console.log(`${stats.engram_count} engrams (${stats.stats_scope} scope)`);
+
+if (stats.storage_bytes_available) {
+  console.log(`${stats.storage_bytes} storage bytes`);
+}
+```
+
 ## Error Handling
 
 The SDK throws typed errors that map to HTTP status codes:

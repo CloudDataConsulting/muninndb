@@ -153,8 +153,13 @@ func (a *grpcEngineAdapter) Stat(ctx context.Context, req *pb.StatRequest) (*pb.
 		return nil, err
 	}
 	return &pb.StatResponse{
-		EngramCount: resp.EngramCount, StorageBytes: resp.StorageBytes,
-		VaultCount: int32(resp.VaultCount), IndexSize: resp.IndexSize,
+		EngramCount:           resp.EngramCount,
+		StorageBytes:          resp.StorageBytes,
+		VaultCount:            int32(resp.VaultCount),
+		IndexSize:             resp.IndexSize,
+		StatsScope:            resp.StatsScope,
+		StorageBytesAvailable: resp.StorageBytesAvailable,
+		IndexSizeAvailable:    resp.IndexSizeAvailable,
 	}, nil
 }
 

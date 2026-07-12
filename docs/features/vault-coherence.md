@@ -47,34 +47,34 @@ A **cognitive health score native to the memory model** has not been implemented
 
 ## API
 
-Coherence scores appear in the `GET /api/stats` response:
+Vault-scoped `GET /api/stats` intentionally omits coherence until the live
+registry, clone/merge/import jobs, and canonical cardinality can be reconciled
+as one source of truth. It currently returns only values that can be stated
+exactly:
 
 ```json
 {
   "engram_count": 1842,
-  "vault_count": 3,
-  "storage_bytes": 4194304,
-  "coherence": {
-    "default": {
-      "score": 0.73,
-      "orphan_ratio": 0.12,
-      "contradiction_density": 0.03,
-      "duplication_pressure": 0.08,
-      "temporal_variance": 0.41,
-      "total_engrams": 1200
-    },
-    "research": {
-      "score": 0.91,
-      ...
-    }
-  }
+  "vault_count": 1,
+  "stats_scope": "vault",
+  "storage_bytes": 0,
+  "storage_bytes_available": false,
+  "index_size_available": false
 }
 ```
 
-## Python SDK
+Vault-authenticated stats responses include only the requested vault. Pebble
+does not expose truthful per-vault disk or index size measurements, so their
+availability fields are `false` and clients must render them as unavailable;
+the numeric zeroes are retained only for wire compatibility. Internal/admin
+calls that omit the vault retain the legacy database-wide aggregate response
+with `stats_scope: "global"`, `storage_bytes_available: true`, and incremental
+coherence diagnostics. Those global coherence values are operational counters,
+not yet a canonical per-vault contract.
 
-```python
-stats = await client.stats()
-for vault_name, coh in (stats.coherence or {}).items():
-    print(f"Vault '{vault_name}': coherence={coh.score:.2f} orphans={coh.orphan_ratio:.1%}")
-```
+`engram_count` uses the maintained per-vault counter. On first access after a
+process start, MuninnDB reconciles that counter once from canonical engram keys;
+subsequent stats requests are constant-time and writes update it in memory.
+
+SDK coherence fields remain optional so clients can read legacy/global
+responses, but applications must not expect them on a vault-scoped response.

@@ -1521,6 +1521,7 @@ func (e *Engine) ActivateWithStructuredFilter(ctx context.Context, req *mbp.Acti
 // activateCore is the shared implementation for Activate and ActivateWithStructuredFilter.
 // structuredFilter may be nil (plain Activate) or a typed predicate (structured query).
 func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, structuredFilter activation.EngramFilter) (*mbp.ActivateResponse, error) {
+	observe := auth.ObserveFromContext(ctx)
 	// Pin a Pebble snapshot so all read phases see a consistent point-in-time view.
 	snap := e.store.NewSnapshot()
 	defer snap.Close()
@@ -1544,8 +1545,19 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 
 	// Build activation.ActivateRequest
 	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
-	e.activity.Record(wsPrefix)
-	vaultSize := e.store.GetVaultCount(ctx, wsPrefix)
+	if !observe {
+		e.activity.Record(wsPrefix)
+	}
+	var vaultSize int64
+	if observe {
+		var err error
+		vaultSize, err = e.store.GetVaultCountReadOnly(ctx, wsPrefix)
+		if err != nil {
+			return nil, fmt.Errorf("activation: count vault: %w", err)
+		}
+	} else {
+		vaultSize = e.store.GetVaultCount(ctx, wsPrefix)
+	}
 	vaultID := wsVaultID(wsPrefix)
 	actReq := &activation.ActivateRequest{
 		VaultID:            vaultID,
@@ -1585,7 +1597,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	}
 
 	// Fix 4: Observe mode is a pure read — skip activation log side effects.
-	actReq.ReadOnly = auth.ObserveFromContext(ctx)
+	actReq.ReadOnly = observe
 
 	// Convert weights if provided; otherwise apply preset weights from Plasticity config.
 	// All scoring goes through ACT-R; legacy temporal path is kept in code but not reachable for now.
@@ -2114,6 +2126,34 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 
 // Stat implements mbp.EngineAPI.Stat.
 func (e *Engine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatResponse, error) {
+	// A named vault is a tenant-scoped request. Return only values that can be
+	// computed truthfully for that vault. Global database size and global
+	// coherence registries are intentionally unavailable: clone/merge/import can
+	// leave incremental coherence counters behind canonical cardinality, so a
+	// scoped response must not present them as exact vault facts.
+	if req.Vault != "" {
+		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+		var engramCount int64
+		var err error
+		if auth.ObserveFromContext(ctx) {
+			engramCount, err = e.store.GetVaultCountReadOnly(ctx, wsPrefix)
+		} else {
+			engramCount, err = e.store.GetVaultCountChecked(ctx, wsPrefix)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat: reconcile vault count: %w", err)
+		}
+		resp := &mbp.StatResponse{
+			EngramCount:           engramCount,
+			VaultCount:            1,
+			StatsScope:            "vault",
+			StorageBytesAvailable: false,
+			IndexSizeAvailable:    false,
+		}
+
+		return resp, nil
+	}
+
 	vaultNames, _ := e.store.ListVaultNames()
 
 	// Count all vaults: data vaults + config-only (empty) vaults, deduplicated.
@@ -2136,16 +2176,13 @@ func (e *Engine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatRespo
 		vaultCount = 1 // preserve the existing "minimum 1" semantics
 	}
 
-	engramCount := e.engramCount.Load()
-	if req.Vault != "" {
-		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
-		engramCount = e.store.GetVaultCount(ctx, wsPrefix)
-	}
-
 	resp := &mbp.StatResponse{
-		EngramCount:  engramCount,
-		VaultCount:   vaultCount,
-		StorageBytes: e.store.DiskSize(),
+		EngramCount:           e.engramCount.Load(),
+		VaultCount:            vaultCount,
+		StorageBytes:          e.store.DiskSize(),
+		StatsScope:            "global",
+		StorageBytesAvailable: true,
+		IndexSizeAvailable:    false,
 	}
 
 	// Attach coherence scores for all vaults if the registry is populated.
@@ -2154,19 +2191,23 @@ func (e *Engine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatRespo
 		if len(snapshots) > 0 {
 			resp.CoherenceScores = make(map[string]mbp.CoherenceResult, len(snapshots))
 			for _, snap := range snapshots {
-				resp.CoherenceScores[snap.VaultName] = mbp.CoherenceResult{
-					Score:                snap.Score,
-					OrphanRatio:          snap.OrphanRatio,
-					ContradictionDensity: snap.ContradictionDensity,
-					DuplicationPressure:  snap.DuplicationPressure,
-					TemporalVariance:     snap.TemporalVariance,
-					TotalEngrams:         snap.TotalEngrams,
-				}
+				resp.CoherenceScores[snap.VaultName] = coherenceResult(snap)
 			}
 		}
 	}
 
 	return resp, nil
+}
+
+func coherenceResult(snap coherence.Result) mbp.CoherenceResult {
+	return mbp.CoherenceResult{
+		Score:                snap.Score,
+		OrphanRatio:          snap.OrphanRatio,
+		ContradictionDensity: snap.ContradictionDensity,
+		DuplicationPressure:  snap.DuplicationPressure,
+		TemporalVariance:     snap.TemporalVariance,
+		TotalEngrams:         snap.TotalEngrams,
+	}
 }
 
 // ListVaults returns all vault names that have been written to.
@@ -2964,4 +3005,3 @@ func (e *Engine) RecordFeedback(ctx context.Context, vault, engramID string, use
 	})
 	return nil
 }
-

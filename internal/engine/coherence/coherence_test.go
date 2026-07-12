@@ -427,6 +427,45 @@ func TestRegistrySnapshotsOrder(t *testing.T) {
 	}
 }
 
+func TestRegistrySnapshotTargetsOneVault(t *testing.T) {
+	reg := NewRegistry()
+	reg.GetOrCreate("alpha").RecordWrite(0.5)
+	reg.GetOrCreate("beta").RecordWrite(0.7)
+
+	got, ok := reg.Snapshot("alpha")
+	if !ok {
+		t.Fatal("Snapshot(alpha) not found")
+	}
+	if got.VaultName != "alpha" || got.TotalEngrams != 1 {
+		t.Fatalf("Snapshot(alpha) = %#v", got)
+	}
+	if _, ok := reg.Snapshot("missing"); ok {
+		t.Fatal("Snapshot(missing) unexpectedly found")
+	}
+}
+
+func TestRegistrySnapshotsConcurrentRenameDelete(t *testing.T) {
+	reg := NewRegistry()
+	reg.GetOrCreate("moving").RecordWrite(0.5)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1_000; i++ {
+			reg.RenameVault("moving", "moved")
+			reg.RenameVault("moved", "moving")
+			reg.DeleteVault("temporary")
+			reg.GetOrCreate("temporary").RecordWrite(0.5)
+		}
+	}()
+
+	for i := 0; i < 1_000; i++ {
+		reg.Snapshots()
+		reg.Snapshot("moving")
+	}
+	<-done
+}
+
 func TestVarianceStability(t *testing.T) {
 	c := &VaultCounters{}
 

@@ -475,21 +475,45 @@ class CoherenceResult
 {
     public function __construct(
         public readonly ?float $score = null,
+        /** Legacy second positional/named argument. */
         public readonly ?int $contradictions = null,
+        public readonly ?float $orphanRatio = null,
+        public readonly ?float $contradictionDensity = null,
+        public readonly ?float $duplicationPressure = null,
+        public readonly ?float $temporalVariance = null,
+        public readonly ?int $totalEngrams = null,
     ) {}
 
     public static function fromArray(array $data): self
     {
         return new self(
             score: isset($data['score']) ? (float) $data['score'] : null,
-            contradictions: $data['contradictions'] ?? null,
+            contradictions: isset($data['contradictions']) ? (int) $data['contradictions'] : null,
+            orphanRatio: isset($data['orphan_ratio']) ? (float) $data['orphan_ratio'] : null,
+            contradictionDensity: isset($data['contradiction_density'])
+                ? (float) $data['contradiction_density']
+                : null,
+            duplicationPressure: isset($data['duplication_pressure'])
+                ? (float) $data['duplication_pressure']
+                : null,
+            temporalVariance: isset($data['temporal_variance'])
+                ? (float) $data['temporal_variance']
+                : null,
+            totalEngrams: isset($data['total_engrams']) ? (int) $data['total_engrams'] : null,
         );
     }
 }
 
 class StatsResponse
 {
+    public readonly int $engramCount;
+    public readonly ?int $vaultCount;
+
+    /**
+     * @param array<string, CoherenceResult>|null $coherenceByVault
+     */
     public function __construct(
+        // Preserve the original positional and named-argument signature.
         public readonly int $totalEngrams,
         public readonly int $totalLinks,
         public readonly ?int $totalVaults = null,
@@ -497,21 +521,75 @@ class StatsResponse
         public readonly ?int $deletedEngrams = null,
         public readonly ?CoherenceResult $coherence = null,
         public readonly ?array $raw = null,
-    ) {}
+        ?int $engramCount = null,
+        ?int $vaultCount = null,
+        public readonly int $indexSize = 0,
+        public readonly int $storageBytes = 0,
+        public readonly string $statsScope = 'unknown',
+        public readonly bool $storageBytesAvailable = false,
+        public readonly bool $indexSizeAvailable = false,
+        public readonly ?array $coherenceByVault = null,
+    ) {
+        $this->engramCount = $engramCount ?? $totalEngrams;
+        $this->vaultCount = $vaultCount ?? $totalVaults;
+    }
 
     public static function fromArray(array $data): self
     {
+        $coherenceByVault = null;
+        $legacyCoherence = null;
+        $coherenceData = $data['coherence'] ?? null;
+
+        if (is_array($coherenceData)) {
+            if (array_key_exists('score', $coherenceData) && !is_array($coherenceData['score'])) {
+                // Pre-scoped-stats servers returned one coherence object.
+                $legacyCoherence = CoherenceResult::fromArray($coherenceData);
+            } else {
+                $coherenceByVault = [];
+                foreach ($coherenceData as $vault => $metrics) {
+                    if (is_string($vault) && is_array($metrics)) {
+                        $coherenceByVault[$vault] = CoherenceResult::fromArray($metrics);
+                    }
+                }
+            }
+        }
+
+        $engramCount = (int) ($data['engram_count'] ?? $data['total_engrams'] ?? 0);
+        $vaultCount = isset($data['vault_count'])
+            ? (int) $data['vault_count']
+            : (isset($data['total_vaults']) ? (int) $data['total_vaults'] : null);
+        $currentCoherence = self::firstCoherence($coherenceByVault);
+
         return new self(
-            totalEngrams: (int) ($data['total_engrams'] ?? 0),
+            totalEngrams: $engramCount,
             totalLinks: (int) ($data['total_links'] ?? 0),
-            totalVaults: $data['total_vaults'] ?? null,
-            activeEngrams: $data['active_engrams'] ?? null,
-            deletedEngrams: $data['deleted_engrams'] ?? null,
-            coherence: isset($data['coherence'])
-                ? CoherenceResult::fromArray($data['coherence'])
-                : null,
+            totalVaults: $vaultCount,
+            activeEngrams: isset($data['active_engrams']) ? (int) $data['active_engrams'] : null,
+            deletedEngrams: isset($data['deleted_engrams']) ? (int) $data['deleted_engrams'] : null,
+            coherence: $legacyCoherence ?? $currentCoherence,
             raw: $data,
+            engramCount: $engramCount,
+            vaultCount: $vaultCount,
+            indexSize: (int) ($data['index_size'] ?? 0),
+            storageBytes: (int) ($data['storage_bytes'] ?? 0),
+            statsScope: is_string($data['stats_scope'] ?? null) && $data['stats_scope'] !== ''
+                ? $data['stats_scope']
+                : 'unknown',
+            storageBytesAvailable: (bool) ($data['storage_bytes_available'] ?? false),
+            indexSizeAvailable: (bool) ($data['index_size_available'] ?? false),
+            coherenceByVault: $coherenceByVault,
         );
+    }
+
+    /** @param array<string, CoherenceResult>|null $coherenceByVault */
+    private static function firstCoherence(?array $coherenceByVault): ?CoherenceResult
+    {
+        if ($coherenceByVault === null || $coherenceByVault === []) {
+            return null;
+        }
+
+        $first = reset($coherenceByVault);
+        return $first instanceof CoherenceResult ? $first : null;
     }
 }
 

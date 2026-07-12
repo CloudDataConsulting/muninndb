@@ -104,22 +104,18 @@ async def main():
 
         print("\n" + "=" * 50)
 
-        # Get database stats including coherence
-        stats = await client.stats()
-        print(f"\nDatabase statistics:")
-        print(f"  Total engrams: {stats.engram_count}")
-        print(f"  Total vaults: {stats.vault_count}")
-        print(f"  Storage: {stats.storage_bytes:,} bytes")
-
-        if stats.coherence and vault in stats.coherence:
-            coherence = stats.coherence[vault]
-            print(f"\nVault '{vault}' coherence:")
-            print(f"  Score: {coherence.score:.3f}")
-            print(f"  Total engrams: {coherence.total_engrams}")
-            print(f"  Orphan ratio: {coherence.orphan_ratio:.3f}")
-            print(f"  Contradiction density: {coherence.contradiction_density:.3f}")
-            print(f"  Duplication pressure: {coherence.duplication_pressure:.3f}")
-
+        # Get exact vault-scoped statistics. Coherence is intentionally omitted
+        # until incremental counters are reconciled with canonical cardinality.
+        stats = await client.stats(vault=vault)
+        print(f"\nStatistics for vault '{vault}':")
+        print(f"  Engrams: {stats.engram_count}")
+        print(f"  Vaults in scope: {stats.vault_count}")
+        storage = (
+            f"{stats.storage_bytes:,} bytes"
+            if stats.storage_bytes_available
+            else "unavailable per vault"
+        )
+        print(f"  Storage: {storage}")
         # Read one engram to show full details
         print(f"\n" + "=" * 50)
         attention_id = ids["attention mechanism"]
