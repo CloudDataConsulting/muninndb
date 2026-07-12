@@ -58,9 +58,17 @@ type PebbleStore struct {
 	// Eliminates the Pebble.Get in ResolveVaultPrefix on every write/activation.
 	// Bounded to 10_000 entries.
 	vaultPrefixCache *lru.Cache[string, [8]byte]
-	// vaultNameWritten: [8]byte → struct{} — tracks vaults whose name has been persisted.
-	// Eliminates the Pebble.Get existence check in WriteVaultName on every write.
-	vaultNameWritten sync.Map
+	// vaultVerifiedCache contains pairs whose persisted 0x0E/0x0F evidence was
+	// globally checked for duplicate-name and duplicate-workspace aliases, or
+	// created atomically by this process. ResolveOrCreate uses it to keep the
+	// established-vault write path O(1) after one validation per process.
+	vaultVerifiedCache *lru.Cache[string, [8]byte]
+	// vaultCatalogMu serializes process-local 0x0E/0x0F catalog transactions.
+	// Pebble already enforces one process per database directory; this mutex makes
+	// every catalog read/check/batch commit linear within one PebbleStore. It is
+	// not a distributed CAS and does not fence ordinary data writes against a
+	// concurrent rename/delete after resolution.
+	vaultCatalogMu sync.RWMutex
 	// recentActiveCache: [8]byte (wsPrefix) → *recentActiveCacheEntry
 	// Caches RecentActive results per vault with a 100ms TTL to avoid repeated SSTable scans.
 	recentActiveCache sync.Map
@@ -68,7 +76,7 @@ type PebbleStore struct {
 	// All transition reads/writes go through this layer; Pebble is only hit on
 	// cold-start loads and periodic flushes.
 	transCache *TransitionCache
-	closeOnce   sync.Once
+	closeOnce  sync.Once
 	// entityLocks and coOccurrenceLocks use fixed-size striped mutex arrays instead of
 	// sync.Map to bound memory growth. sync.Map grows unbounded (one entry per unique key
 	// ever seen); stripedMutex uses a constant 256 × sizeof(sync.Mutex) ≈ 6 KB.
@@ -173,15 +181,17 @@ func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 	prov := provenance.NewStore(db)
 	metaCache, _ := lru.New[[16]byte, *EngramMeta](100_000)
 	vaultPrefixCache, _ := lru.New[string, [8]byte](10_000)
+	vaultVerifiedCache, _ := lru.New[string, [8]byte](10_000)
 	assocCache := expirable.NewLRU[[24]byte, *assocCacheEntry](500_000, nil, 2*time.Second)
 	ps := &PebbleStore{
-		db:               db,
-		cache:            NewL1Cache(cfg.CacheSize),
-		provenance:       prov,
-		noSyncEngrams:    cfg.NoSyncEngrams,
-		metaCache:        metaCache,
-		vaultPrefixCache: vaultPrefixCache,
-		assocCache:       assocCache,
+		db:                 db,
+		cache:              NewL1Cache(cfg.CacheSize),
+		provenance:         prov,
+		noSyncEngrams:      cfg.NoSyncEngrams,
+		metaCache:          metaCache,
+		vaultPrefixCache:   vaultPrefixCache,
+		vaultVerifiedCache: vaultVerifiedCache,
+		assocCache:         assocCache,
 	}
 	ps.walSync = newWALSyncer(db)
 	ps.counterFlush = newCounterCoalescer(db)

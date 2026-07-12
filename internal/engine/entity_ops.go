@@ -45,7 +45,7 @@ func (e *Engine) GetEntityAggregate(ctx context.Context, vault, entityName strin
 		return nil, nil // not found
 	}
 
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 
 	// 2. Engrams that mention this entity (vault-scoped via ScanEntityEngrams reverse index)
 	var engrams []*storage.Engram
@@ -114,7 +114,7 @@ func (e *Engine) ListEntities(ctx context.Context, vault string, limit int, stat
 		limit = defaultListEntitiesLimit
 	}
 
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 
 	var records []storage.EntityRecord
 	err := e.store.ScanVaultEntityNames(ctx, ws, func(name string) error {

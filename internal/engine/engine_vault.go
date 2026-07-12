@@ -26,6 +26,33 @@ var ErrEngramSoftDeleted = errors.New("engram is soft-deleted")
 // that already exists. Use errors.Is to check for this error in callers.
 var ErrVaultNameCollision = errors.New("vault name already exists")
 
+func canonicalVaultName(name string) string {
+	if name == "" {
+		return "default"
+	}
+	return name
+}
+
+// resolveVaultPrefix preserves the permissive read behavior for unregistered
+// names while making the public empty name consistently mean "default". A
+// persisted legacy default mapping still wins over the name-derived workspace.
+func (e *Engine) resolveVaultPrefix(vaultName string) [8]byte {
+	return e.store.ResolveVaultPrefix(canonicalVaultName(vaultName))
+}
+
+// resolveOrCreateVaultPrefix reserves a valid process-local catalog pair
+// before a runtime creator writes canonical data. The storage transaction is
+// intentionally short-lived; it does not fence the subsequent data write from
+// a concurrent rename/delete and is not a distributed lifecycle CAS.
+func (e *Engine) resolveOrCreateVaultPrefix(vaultName string) ([8]byte, error) {
+	vaultName = canonicalVaultName(vaultName)
+	ws, err := e.store.ResolveOrCreateVaultPrefix(vaultName)
+	if err != nil {
+		return [8]byte{}, fmt.Errorf("resolve or create vault %q: %w", vaultName, err)
+	}
+	return ws, nil
+}
+
 // resolveExistingVaultPrefix preserves the public distinction between a vault
 // that is genuinely absent and a persisted lifecycle mapping that is damaged.
 // ResolveExistingVaultPrefix deliberately returns the underlying storage error
@@ -34,6 +61,7 @@ var ErrVaultNameCollision = errors.New("vault name already exists")
 // a storage failure so destructive callers fail closed instead of treating
 // corruption as an ordinary 404.
 func (e *Engine) resolveExistingVaultPrefix(vaultName string) ([8]byte, error) {
+	vaultName = canonicalVaultName(vaultName)
 	ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
 	if err == nil {
 		return ws, nil
@@ -68,6 +96,7 @@ func (e *Engine) resolveExistingVaultPrefix(vaultName string) ([8]byte, error) {
 // Rename may pass its resolved source workspace so renaming a vault back to its
 // original derived name remains safe.
 func (e *Engine) ensureVaultNameAvailable(vaultName string, allowedWorkspace *[8]byte) error {
+	vaultName = canonicalVaultName(vaultName)
 	_, err := e.resolveExistingVaultPrefix(vaultName)
 	if err == nil {
 		return fmt.Errorf("vault %q: %w", vaultName, ErrVaultNameCollision)
@@ -94,6 +123,7 @@ func (e *Engine) ensureVaultNameAvailable(vaultName string, allowedWorkspace *[8
 // It evicts all in-memory state (HNSW, FTS IDF cache, novelty fingerprints, coherence
 // counters, activity tracking) and adjusts the global engramCount.
 func (e *Engine) ClearVault(ctx context.Context, vaultName string) error {
+	vaultName = canonicalVaultName(vaultName)
 	mu := e.getVaultMutex(vaultName)
 	mu.Lock()
 	defer mu.Unlock()
@@ -163,6 +193,7 @@ var ErrVaultJobActive = fmt.Errorf("vault has an active job in progress")
 // Note: ws must be resolved BEFORE calling ClearVault because renamed vaults
 // retain their original workspace.
 func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
+	vaultName = canonicalVaultName(vaultName)
 	// Serialize the full delete lifecycle with rename and name-reserving
 	// clone/merge/import setup. Without this lock, rename can move 0x0E/0x0F
 	// after clear but before name cleanup, leaving a dangling name index.
@@ -218,6 +249,8 @@ func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 // doesn't exist, ErrVaultJobActive if an asynchronous job involves the vault,
 // or an error if newName already exists.
 func (e *Engine) RenameVault(ctx context.Context, oldName, newName string) error {
+	oldName = canonicalVaultName(oldName)
+	newName = canonicalVaultName(newName)
 	e.vaultOpsMu.Lock()
 	defer e.vaultOpsMu.Unlock()
 

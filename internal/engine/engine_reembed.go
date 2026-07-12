@@ -23,6 +23,7 @@ import (
 // goroutine (typically seconds). Actual re-embedding is handled by the existing
 // RetroactiveProcessor micro-batch pipeline.
 func (e *Engine) StartReembedVault(ctx context.Context, vaultName, modelName string) (*vaultjob.Job, error) {
+	vaultName = canonicalVaultName(vaultName)
 	// Keep persisted-name resolution and job registration atomic with rename
 	// and delete. Once the job is registered, their active-job guards prevent
 	// either lifecycle operation from invalidating the name captured by the job.

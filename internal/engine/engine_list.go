@@ -41,7 +41,7 @@ func (e *Engine) ListEngrams(ctx context.Context, params ListEngramsParams) (*Li
 		params.Sort = "created"
 	}
 
-	ws := e.store.ResolveVaultPrefix(params.Vault)
+	ws := e.resolveVaultPrefix(params.Vault)
 
 	// Parse optional state filter.
 	var stateFilter *storage.LifecycleState

@@ -35,7 +35,7 @@ func (e *Engine) FindSimilarEntities(ctx context.Context, vault string, threshol
 		topN = 20
 	}
 
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 
 	var names []string
 	err := e.store.ScanVaultEntityNames(ctx, ws, func(name string) error {
@@ -108,6 +108,7 @@ func (e *Engine) FindSimilarEntities(ctx context.Context, vault string, threshol
 //
 // When dryRun=true the function reports what would happen without writing anything.
 func (e *Engine) MergeEntity(ctx context.Context, vault, entityA, entityB string, dryRun bool) (*MergeEntityResult, error) {
+	vault = canonicalVaultName(vault)
 	if entityA == "" || entityB == "" {
 		return nil, fmt.Errorf("merge_entity: entity_a and entity_b are required")
 	}

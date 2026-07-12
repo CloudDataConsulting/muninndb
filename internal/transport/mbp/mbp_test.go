@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scrypster/muninndb/internal/storage"
 )
 
 // ---------------------------------------------------------------------------
@@ -17,10 +19,14 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubEngine struct {
+	helloErr error
 	writeErr error
 }
 
 func (e *stubEngine) Hello(_ context.Context, req *HelloRequest) (*HelloResponse, error) {
+	if e.helloErr != nil {
+		return nil, e.helloErr
+	}
 	return BuildHelloResponse("sess-1", "default", req.Capabilities), nil
 }
 
@@ -817,6 +823,38 @@ func TestServer_HelloBadVersion(t *testing.T) {
 	}
 	if ep.Code != ErrAuthFailed {
 		t.Errorf("code: got %d, want %d", ep.Code, ErrAuthFailed)
+	}
+}
+
+func TestServer_HelloCatalogFailureIsStorageError(t *testing.T) {
+	s := newTestServer(&stubEngine{helloErr: fmt.Errorf("hello: %w", storage.ErrVaultCatalogCorrupt)})
+	c, wait := startTestConn(t, s)
+	defer wait()
+
+	req := HelloRequest{Version: "1", AuthMethod: "none", Vault: "corrupt-vault"}
+	payload, err := EncodeMsgpack(&req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFrame(c, &Frame{Version: 0x01, Type: TypeHello, CorrelationID: 41, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := ReadFrame(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Type != TypeError {
+		t.Fatalf("response type = 0x%02x, want TypeError", resp.Type)
+	}
+	var errorPayload ErrorPayload
+	if err := DecodeMsgpack(resp.Payload, &errorPayload); err != nil {
+		t.Fatal(err)
+	}
+	if errorPayload.Code != ErrStorageError {
+		t.Fatalf("error code = %d, want %d", errorPayload.Code, ErrStorageError)
+	}
+	if !strings.Contains(errorPayload.Message, storage.ErrVaultCatalogCorrupt.Error()) {
+		t.Fatalf("error message = %q, want catalog corruption", errorPayload.Message)
 	}
 }
 

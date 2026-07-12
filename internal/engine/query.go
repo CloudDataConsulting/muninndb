@@ -37,7 +37,7 @@ type ExplainData struct {
 
 // GetAssociations returns the forward associations for a single engram by string ID.
 func (e *Engine) GetAssociations(ctx context.Context, vault, engramID string, maxN int) ([]storage.Association, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	id, err := storage.ParseULID(engramID)
 	if err != nil {
 		return nil, fmt.Errorf("parse id: %w", err)
@@ -52,7 +52,7 @@ func (e *Engine) GetAssociations(ctx context.Context, vault, engramID string, ma
 // GetAssociationsBatch returns forward associations for multiple engrams.
 // The storage layer already supports batching with a single Pebble iterator.
 func (e *Engine) GetAssociationsBatch(ctx context.Context, vault string, engramIDs []string, maxN int) (map[string][]storage.Association, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	ids := make([]storage.ULID, len(engramIDs))
 	for i, s := range engramIDs {
 		id, err := storage.ParseULID(s)
@@ -80,13 +80,14 @@ func (e *Engine) GetAssociationsBatch(ctx context.Context, vault string, engramI
 
 // GetContradictions returns all contradiction pairs stored in a vault.
 func (e *Engine) GetContradictions(ctx context.Context, vault string) ([][2]storage.ULID, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	return e.store.GetContradictions(ctx, ws)
 }
 
 // ResolveContradiction removes the contradiction marker for the pair (idA, idB)
 // and updates the vault coherence counters.
 func (e *Engine) ResolveContradiction(ctx context.Context, vault, idA, idB string) error {
+	vault = canonicalVaultName(vault)
 	a, err := storage.ParseULID(idA)
 	if err != nil {
 		return fmt.Errorf("parse id_a: %w", err)
@@ -95,7 +96,7 @@ func (e *Engine) ResolveContradiction(ctx context.Context, vault, idA, idB strin
 	if err != nil {
 		return fmt.Errorf("parse id_b: %w", err)
 	}
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	if err := e.store.ResolveContradiction(ctx, ws, a, b); err != nil {
 		return err
 	}
@@ -117,7 +118,7 @@ const entityHopWeight = 0.1
 // are looked up, and every other engram in the same vault that also mentions
 // those entities is enqueued at depth d+1 (with entityHopWeight).
 func (e *Engine) Traverse(ctx context.Context, vault, startID string, maxHops, maxNodes int, followEntities bool) ([]TraversalNode, []TraversalEdge, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	start, err := storage.ParseULID(startID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse start id: %w", err)

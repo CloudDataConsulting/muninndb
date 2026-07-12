@@ -20,7 +20,7 @@ func (e *Engine) FindByEntity(ctx context.Context, vault, entityName string, lim
 	if limit > 50 {
 		limit = 50
 	}
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	var results []*storage.Engram
 	err := e.store.ScanEntityEngrams(ctx, entityName, func(gotWS [8]byte, id storage.ULID) error {
 		if gotWS != ws {

@@ -188,7 +188,10 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	// Call engine's Hello handler
 	helloResp, err := s.engine.Hello(connCtx, &helloReq)
 	if err != nil {
-		s.writeErrorFrame(conn, helloFrame.CorrelationID, ErrAuthFailed, err.Error())
+		// Authentication and request validation have already succeeded. Engine
+		// Hello failures now include fail-closed vault-catalog/storage errors and
+		// must not be mislabeled as bad credentials.
+		s.writeErrorFrame(conn, helloFrame.CorrelationID, ErrStorageError, err.Error())
 		return
 	}
 

@@ -21,6 +21,7 @@ import (
 // NOTE: This method does NOT rebuild HNSW embeddings — it is FTS-only.
 // The vault must exist in the registered name list or ErrVaultNotFound is returned.
 func (e *Engine) ReindexFTSVault(ctx context.Context, vaultName string) (int64, error) {
+	vaultName = canonicalVaultName(vaultName)
 	mu := e.getVaultMutex(vaultName)
 	mu.Lock()
 	defer mu.Unlock()

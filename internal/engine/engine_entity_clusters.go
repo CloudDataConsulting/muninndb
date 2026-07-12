@@ -17,7 +17,7 @@ type EntityCluster struct {
 // sorted by count descending. Only pairs with count >= minCount are included.
 // Results are capped at topN entries.
 func (e *Engine) GetEntityClusters(ctx context.Context, vault string, minCount, topN int) ([]EntityCluster, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 
 	var clusters []EntityCluster
 	err := e.store.ScanEntityClusters(ctx, ws, minCount, func(nameA, nameB string, count int) error {

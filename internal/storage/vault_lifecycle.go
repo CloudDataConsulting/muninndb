@@ -111,16 +111,32 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 // and evicts the in-memory vault name caches.
 // Must be called AFTER ClearVault so that the data keys are already gone.
 func (ps *PebbleStore) DeleteVaultNameOnly(ctx context.Context, name string, ws [8]byte) error {
-	// Point-delete 0x0E vault meta key (prefix → name mapping).
-	if err := ps.db.Delete(keys.VaultMetaKey(ws), pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
-		return fmt.Errorf("delete vault name: remove meta key: %w", err)
+	_ = ctx
+	ps.vaultCatalogMu.Lock()
+	defer ps.vaultCatalogMu.Unlock()
+
+	resolved, err := ps.resolveExistingVaultPrefixLocked(name)
+	if err != nil {
+		return fmt.Errorf("delete vault name: resolve %q: %w", name, err)
 	}
-	// Point-delete 0x0F name index key (name → prefix mapping).
-	if err := ps.db.Delete(keys.VaultNameIndexKey(name), pebble.Sync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
-		return fmt.Errorf("delete vault name: remove name index key: %w", err)
+	if resolved != ws {
+		return fmt.Errorf("delete vault name: resolved workspace %x differs from requested %x", resolved, ws)
+	}
+
+	// Remove both directions in one Sync-durable catalog transaction.
+	batch := ps.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Delete(keys.VaultMetaKey(ws), nil); err != nil {
+		return fmt.Errorf("delete vault name: queue meta key: %w", err)
+	}
+	if err := batch.Delete(keys.VaultNameIndexKey(name), nil); err != nil {
+		return fmt.Errorf("delete vault name: queue name index key: %w", err)
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("delete vault name: commit: %w", err)
 	}
 	// Evict in-memory name caches.
 	ps.vaultPrefixCache.Remove(name)
-	ps.vaultNameWritten.Delete(ws)
+	ps.vaultVerifiedCache.Remove(name)
 	return nil
 }

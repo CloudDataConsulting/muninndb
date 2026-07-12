@@ -138,8 +138,9 @@ type EngineStore interface {
 	// DiskSize returns the total on-disk size of all database files in bytes.
 	DiskSize() int64
 
-	// WriteVaultName persists the human-readable vault name so ListVaultNames
-	// can return it. Safe to call on every write (idempotent, cheap).
+	// WriteVaultName persists or strictly validates an exact human-readable
+	// vault-name pair so ListVaultNames can return it. Runtime creator hot paths
+	// should use PebbleStore.ResolveOrCreateVaultPrefix instead.
 	WriteVaultName(wsPrefix [8]byte, name string) error
 
 	// ResolveVaultPrefix returns the actual workspace prefix for a vault name,

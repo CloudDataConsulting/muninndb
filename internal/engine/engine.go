@@ -43,13 +43,13 @@ type CognitiveForwarder interface {
 
 // Engine is the cognitive database engine implementing mbp.EngineAPI.
 type Engine struct {
-	store            *storage.PebbleStore
-	authStore        *auth.Store // nil = use Plasticity defaults (e.g. in tests)
-	fts              *fts.Index
-	ftsWorker        *fts.Worker  // async FTS indexing — decoupled from write hot path
-	activation       *activation.ActivationEngine
-	triggers         *trigger.TriggerSystem
-	engramCount      atomic.Int64
+	store       *storage.PebbleStore
+	authStore   *auth.Store // nil = use Plasticity defaults (e.g. in tests)
+	fts         *fts.Index
+	ftsWorker   *fts.Worker // async FTS indexing — decoupled from write hot path
+	activation  *activation.ActivationEngine
+	triggers    *trigger.TriggerSystem
+	engramCount atomic.Int64
 	// ──────────────────────────────────────────────────────────────────
 	// Cognitive Worker Subsystem
 	// ──────────────────────────────────────────────────────────────────
@@ -106,26 +106,26 @@ type Engine struct {
 	// code (or server.go in standalone) is responsible for calling
 	// hebbianWorker.Stop(), etc. before the process exits.
 	// ──────────────────────────────────────────────────────────────────
-	cogMu              sync.RWMutex
-	hebbianWorker      *cognitive.HebbianWorker
-	contradictWorker   *cognitive.Worker[cognitive.ContradictItem]
-	confidenceWorker   *cognitive.Worker[cognitive.ConfidenceUpdate]
-	transitionWorker   *cognitive.TransitionWorker
+	cogMu            sync.RWMutex
+	hebbianWorker    *cognitive.HebbianWorker
+	contradictWorker *cognitive.Worker[cognitive.ContradictItem]
+	confidenceWorker *cognitive.Worker[cognitive.ConfidenceUpdate]
+	transitionWorker *cognitive.TransitionWorker
 	activity         *cognitive.ActivityTracker
-	embedder activation.Embedder // optional embedder for embedding-based brief scoring
+	embedder         activation.Embedder // optional embedder for embedding-based brief scoring
 	// Feature subsystems (all optional, nil-safe)
-	autoAssoc      *autoassoc.Worker    // write-time automatic tag-based associations
-	neighborWorker *autoassoc.NeighborWorker // semantic neighbor auto-linking
-	goalLinkWorker *autoassoc.GoalLinkWorker  // goal-aware semantic auto-linking
-	noveltyDet           *novelty.Detector // write-time near-duplicate detection
-	noveltyJobs          chan noveltyJob    // async novelty work queue
-	noveltyDone          chan struct{}      // signals novelty worker shutdown
-	pruneDone            chan struct{}      // signals prune worker shutdown
-	idempotencySweepDone chan struct{}      // signals idempotency sweep worker shutdown
-	archiveGCDone        chan struct{}      // signals archive GC worker shutdown
-	coherence   *coherence.Registry // per-vault incremental coherence counters
-	scoring     *scoring.Store      // per-vault learnable scoring weights
-	prov        *provenance.Store   // audit trail per-engram
+	autoAssoc            *autoassoc.Worker         // write-time automatic tag-based associations
+	neighborWorker       *autoassoc.NeighborWorker // semantic neighbor auto-linking
+	goalLinkWorker       *autoassoc.GoalLinkWorker // goal-aware semantic auto-linking
+	noveltyDet           *novelty.Detector         // write-time near-duplicate detection
+	noveltyJobs          chan noveltyJob           // async novelty work queue
+	noveltyDone          chan struct{}             // signals novelty worker shutdown
+	pruneDone            chan struct{}             // signals prune worker shutdown
+	idempotencySweepDone chan struct{}             // signals idempotency sweep worker shutdown
+	archiveGCDone        chan struct{}             // signals archive GC worker shutdown
+	coherence            *coherence.Registry       // per-vault incremental coherence counters
+	scoring              *scoring.Store            // per-vault learnable scoring weights
+	prov                 *provenance.Store         // audit trail per-engram
 
 	// Fix 5: coherence persistence lifecycle
 	coherenceFlushStop chan struct{}
@@ -185,10 +185,10 @@ type Engine struct {
 	stopOnce sync.Once
 
 	// Vault lifecycle fields
-	vaultOpsMu   sync.Mutex     // serializes vault name reservation, rename, and delete
-	jobManager   *vaultjob.Manager  // tracks async clone/merge jobs
-	stopCtx      context.Context    // cancelled on Stop() to signal goroutines
-	stopCancel   context.CancelFunc
+	vaultOpsMu sync.Mutex        // serializes vault name reservation, rename, and delete
+	jobManager *vaultjob.Manager // tracks async clone/merge jobs
+	stopCtx    context.Context   // cancelled on Stop() to signal goroutines
+	stopCancel context.CancelFunc
 
 	// Goroutine lifecycle tracking — see spawnFireAndForget and spawnJob.
 	// Per-request fire-and-forget goroutines (Read, RecordAccess).
@@ -198,7 +198,7 @@ type Engine struct {
 	jobWG      sync.WaitGroup
 	jobStopped atomic.Bool
 
-	hnswRegistry *hnsw.Registry     // per-vault HNSW indexes (shared with activation)
+	hnswRegistry *hnsw.Registry // per-vault HNSW indexes (shared with activation)
 
 	// vaultMu provides per-vault mutual exclusion for destructive vault operations
 	// (PruneVault, ReindexFTSVault, ClearVault). Maps string vault name → *sync.Mutex.
@@ -324,8 +324,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 		activity:         cognitive.NewActivityTracker(),
 		embedder:         cfg.Embedder,
 		autoAssoc:        autoassoc.New(stopCtx, store, cfg.FTSIndex),
-		neighborWorker:  autoassoc.NewNeighborWorker(stopCtx, store, cfg.HNSWRegistry),
-		goalLinkWorker:  autoassoc.NewGoalLinkWorker(stopCtx, store, cfg.HNSWRegistry),
+		neighborWorker:   autoassoc.NewNeighborWorker(stopCtx, store, cfg.HNSWRegistry),
+		goalLinkWorker:   autoassoc.NewGoalLinkWorker(stopCtx, store, cfg.HNSWRegistry),
 		noveltyDet:       novelty.New(),
 		noveltyJobs:      make(chan noveltyJob, 256),
 		noveltyDone:      make(chan struct{}),
@@ -336,8 +336,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 		stopCtx:          stopCtx,
 		stopCancel:       stopCancel,
 		hnswRegistry:     cfg.HNSWRegistry,
-		jobManager:          vaultjob.NewManager(),
-		replayFailCounts:    make(map[storage.ULID]int),
+		jobManager:       vaultjob.NewManager(),
+		replayFailCounts: make(map[storage.ULID]int),
 	}
 	// Start async novelty worker to decouple O(N) Jaccard scan from write hot path.
 	// engine:spawn-ok — tracked by noveltyDone channel, drained in Stop()
@@ -576,9 +576,9 @@ func (e *Engine) Stop() {
 //
 // MUST be used instead of bare `go` for all per-request goroutines.
 func (e *Engine) spawnFireAndForget(fn func()) bool {
-	e.fireAndForgetWG.Add(1)            // Add FIRST — visible to wg.Wait() in Stop()
+	e.fireAndForgetWG.Add(1) // Add FIRST — visible to wg.Wait() in Stop()
 	if e.fireAndForgetStopped.Load() {
-		e.fireAndForgetWG.Done()         // Undo — engine is shutting down
+		e.fireAndForgetWG.Done() // Undo — engine is shutting down
 		return false
 	}
 	// engine:spawn-ok — tracked by fireAndForgetWG, drained in Stop() before store.Close()
@@ -595,9 +595,9 @@ func (e *Engine) spawnFireAndForget(fn func()) bool {
 //
 // MUST be used instead of bare `go` for all vault job goroutines.
 func (e *Engine) spawnJob(fn func()) bool {
-	e.jobWG.Add(1)                      // Add FIRST — visible to wg.Wait() in Stop()
+	e.jobWG.Add(1) // Add FIRST — visible to wg.Wait() in Stop()
 	if e.jobStopped.Load() {
-		e.jobWG.Done()                   // Undo — engine is shutting down
+		e.jobWG.Done() // Undo — engine is shutting down
 		return false
 	}
 	// engine:spawn-ok — tracked by jobWG, drained in Stop() before jobManager.Close()
@@ -677,13 +677,13 @@ func (e *Engine) Store() *storage.PebbleStore {
 
 // GetEngram fetches a single engram by vault and ULID.
 func (e *Engine) GetEngram(ctx context.Context, vault string, id storage.ULID) (*storage.Engram, error) {
-	wsPrefix := e.store.ResolveVaultPrefix(vault)
+	wsPrefix := e.resolveVaultPrefix(vault)
 	return e.store.GetEngram(ctx, wsPrefix, id)
 }
 
 // UpdateTags replaces the tags on an engram.
 func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, tags []string) error {
-	wsPrefix := e.store.ResolveVaultPrefix(vault)
+	wsPrefix := e.resolveVaultPrefix(vault)
 	return e.store.UpdateTags(ctx, wsPrefix, id, tags)
 }
 
@@ -721,19 +721,15 @@ func (e *Engine) Hello(ctx context.Context, req *mbp.HelloRequest) (*mbp.HelloRe
 
 	// Register the vault name so it appears in ListVaults even before the
 	// first engram is written (idempotent, cheap).
-	vaultName := req.Vault
-	if vaultName == "" {
-		vaultName = "default"
-	}
-	wsPrefix := e.store.ResolveVaultPrefix(vaultName)
-	if err := e.store.WriteVaultName(wsPrefix, vaultName); err != nil {
-		slog.Warn("engine: Hello: failed to persist vault name", "vault", vaultName, "err", err)
+	vaultName := canonicalVaultName(req.Vault)
+	if _, err := e.resolveOrCreateVaultPrefix(vaultName); err != nil {
+		return nil, fmt.Errorf("hello: %w", err)
 	}
 
 	return &mbp.HelloResponse{
 		ServerVersion: "1.0.0",
 		SessionID:     uuid.New().String(),
-		VaultID:       req.Vault,
+		VaultID:       vaultName,
 		Capabilities:  []string{"compression"},
 		Limits: mbp.Limits{
 			MaxResults:   100,
@@ -747,14 +743,9 @@ func (e *Engine) Hello(ctx context.Context, req *mbp.HelloRequest) (*mbp.HelloRe
 // Write implements mbp.EngineAPI.Write.
 func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
 	writeStart := time.Now()
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
-	e.activity.Record(wsPrefix)
 
 	// Resolve inline enrichment mode for this vault.
-	vaultName := req.Vault
-	if vaultName == "" {
-		vaultName = "default"
-	}
+	vaultName := canonicalVaultName(req.Vault)
 	resolved := e.ResolveVaultPlasticity(vaultName)
 	inlineMode := resolved.InlineEnrichment
 
@@ -813,6 +804,14 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		}
 	}
 	eng.Associations = assocs
+
+	// Reserve or strictly resolve the catalog pair before any canonical data is
+	// committed. Mapping failures are request failures, never post-write warnings.
+	wsPrefix, err := e.resolveOrCreateVaultPrefix(vaultName)
+	if err != nil {
+		return nil, fmt.Errorf("write engram: %w", err)
+	}
+	e.activity.Record(wsPrefix)
 
 	// Write to store
 	id, err := e.store.WriteEngram(ctx, wsPrefix, eng)
@@ -919,11 +918,6 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		}
 	}
 
-	// Persist vault name for discovery (idempotent, cheap)
-	if err := e.store.WriteVaultName(wsPrefix, vaultName); err != nil {
-		slog.Warn("engine: failed to persist vault name", "vault", vaultName, "err", err)
-	}
-
 	// Submit to async FTS worker — decoupled from write hot path.
 	// Engram is already durable; FTS visibility follows within ~100ms.
 	if e.ftsWorker != nil {
@@ -1014,7 +1008,6 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		})
 	}
 
-
 	// Write-time semantic neighbor linking: find semantically similar engrams via HNSW.
 	if e.neighborWorker != nil && len(eng.Embedding) > 0 {
 		e.neighborWorker.EnqueueNeighborJob(autoassoc.NeighborJob{
@@ -1078,15 +1071,15 @@ var ErrBatchTooLarge = fmt.Errorf("batch size exceeds maximum of %d", MaxBatchSi
 // the prepared engram plus post-commit metadata. This avoids re-deriving
 // vault prefixes and enrichment fields after the batch commits.
 type preparedBatchItem struct {
-	wsPrefix                [8]byte
-	vaultName               string
-	eng                     *storage.Engram
-	inlineMode              string
-	callerSummary           string
-	callerEntities          []mbp.InlineEntity
-	callerRelationships     []mbp.InlineRelationship
+	wsPrefix                  [8]byte
+	vaultName                 string
+	eng                       *storage.Engram
+	inlineMode                string
+	callerSummary             string
+	callerEntities            []mbp.InlineEntity
+	callerRelationships       []mbp.InlineRelationship
 	callerEntityRelationships []mbp.InlineEntityRelationship
-	skipBackgroundEnrich    bool
+	skipBackgroundEnrich      bool
 }
 
 // WriteBatch writes multiple engrams in a single Pebble batch commit, then
@@ -1105,19 +1098,15 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 	responses := make([]*mbp.WriteResponse, n)
 	errs := make([]error, n)
 
-	// Phase 1: Prepare all engrams (pure computation, no I/O).
-	items := make([]storage.EngramBatchItem, n)
+	// Phase 1: Validate and prepare all engrams, then resolve each valid vault
+	// through the serialized creator catalog before the data batch commits.
+	items := make([]storage.EngramBatchItem, 0, n)
+	itemIndexes := make([]int, 0, n)
 	prepared := make([]preparedBatchItem, n)
-	validCount := 0
+	resolvedVaults := make(map[string][8]byte)
 
 	for i, req := range reqs {
-		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
-		e.activity.Record(wsPrefix)
-
-		vaultName := req.Vault
-		if vaultName == "" {
-			vaultName = "default"
-		}
+		vaultName := canonicalVaultName(req.Vault)
 		resolved := e.ResolveVaultPlasticity(vaultName)
 		inlineMode := resolved.InlineEnrichment
 
@@ -1175,10 +1164,23 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		}
 		eng.Associations = assocs
 
+		wsPrefix, ok := resolvedVaults[vaultName]
+		if !ok {
+			var resolveErr error
+			wsPrefix, resolveErr = e.resolveOrCreateVaultPrefix(vaultName)
+			if resolveErr != nil {
+				errs[i] = fmt.Errorf("resolve or create vault: %w", resolveErr)
+				continue
+			}
+			resolvedVaults[vaultName] = wsPrefix
+		}
+		e.activity.Record(wsPrefix)
+
 		callerProvidedAny := callerSummary != "" || len(callerEntities) > 0
 		skipBG := (inlineMode == "caller_only" && callerProvidedAny) || inlineMode == "disabled"
 
-		items[i] = storage.EngramBatchItem{WSPrefix: wsPrefix, Engram: eng}
+		items = append(items, storage.EngramBatchItem{WSPrefix: wsPrefix, Engram: eng})
+		itemIndexes = append(itemIndexes, i)
 		prepared[i] = preparedBatchItem{
 			wsPrefix:                  wsPrefix,
 			vaultName:                 vaultName,
@@ -1190,21 +1192,19 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			callerEntityRelationships: req.EntityRelationships,
 			skipBackgroundEnrich:      skipBG,
 		}
-		validCount++
 	}
 
 	// Phase 2: Single Pebble batch commit for all valid engrams.
-	ids, batchErrs := e.store.WriteEngramBatch(ctx, items)
-	for i := range reqs {
-		if errs[i] != nil {
-			continue // already failed in prepare phase
-		}
-		if batchErrs[i] != nil {
-			errs[i] = fmt.Errorf("write engram: %w", batchErrs[i])
+	batchIDs, batchErrs := e.store.WriteEngramBatch(ctx, items)
+	ids := make([]storage.ULID, n)
+	for batchIndex, requestIndex := range itemIndexes {
+		if batchErrs[batchIndex] != nil {
+			errs[requestIndex] = fmt.Errorf("write engram: %w", batchErrs[batchIndex])
 			continue
 		}
-		responses[i] = &mbp.WriteResponse{
-			ID:        ids[i].String(),
+		ids[requestIndex] = batchIDs[batchIndex]
+		responses[requestIndex] = &mbp.WriteResponse{
+			ID:        batchIDs[batchIndex].String(),
 			CreatedAt: time.Now().UnixNano(),
 		}
 	}
@@ -1306,10 +1306,6 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 
 		if p.skipBackgroundEnrich {
 			_ = e.store.SetDigestFlag(ctx, id, plugin.DigestEnrich)
-		}
-
-		if err := e.store.WriteVaultName(p.wsPrefix, p.vaultName); err != nil {
-			slog.Warn("engine: failed to persist vault name", "vault", p.vaultName, "err", err)
 		}
 
 		if e.ftsWorker != nil {
@@ -1429,7 +1425,7 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 // Read implements mbp.EngineAPI.Read.
 func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error) {
 	readStart := time.Now()
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+	wsPrefix := e.resolveVaultPrefix(req.Vault)
 
 	id, err := storage.ParseULID(req.ID)
 	if err != nil {
@@ -1489,24 +1485,24 @@ func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadRespo
 	if e.latencyTracker != nil {
 		e.latencyTracker.Record(wsPrefix, "read", d)
 	}
-	metrics.ReadDuration.WithLabelValues(req.Vault).Observe(d.Seconds())
+	metrics.ReadDuration.WithLabelValues(canonicalVaultName(req.Vault)).Observe(d.Seconds())
 
 	return &mbp.ReadResponse{
-		ID:             eng.ID.String(),
-		Concept:        eng.Concept,
-		Content:        eng.Content,
-		Confidence:     eng.Confidence,
-		Relevance:      eng.Relevance,
-		Stability:      eng.Stability,
-		AccessCount:    eng.AccessCount,
-		Tags:           eng.Tags,
-		State:          uint8(eng.State),
-		CreatedAt:      eng.CreatedAt.UnixNano(),
-		UpdatedAt:      eng.UpdatedAt.UnixNano(),
-		LastAccess:     eng.LastAccess.UnixNano(),
-		Summary:        eng.Summary,
-		KeyPoints:      eng.KeyPoints,
-		MemoryType:     uint8(eng.MemoryType),
+		ID:                  eng.ID.String(),
+		Concept:             eng.Concept,
+		Content:             eng.Content,
+		Confidence:          eng.Confidence,
+		Relevance:           eng.Relevance,
+		Stability:           eng.Stability,
+		AccessCount:         eng.AccessCount,
+		Tags:                eng.Tags,
+		State:               uint8(eng.State),
+		CreatedAt:           eng.CreatedAt.UnixNano(),
+		UpdatedAt:           eng.UpdatedAt.UnixNano(),
+		LastAccess:          eng.LastAccess.UnixNano(),
+		Summary:             eng.Summary,
+		KeyPoints:           eng.KeyPoints,
+		MemoryType:          uint8(eng.MemoryType),
 		TypeLabel:           eng.TypeLabel,
 		Classification:      eng.Classification,
 		EmbedDim:            uint8(eng.EmbedDim),
@@ -1536,14 +1532,15 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	activateStart := time.Now()
 
 	// Resolve per-vault Plasticity config. nil authStore means use defaults (tests, bench).
+	vaultName := canonicalVaultName(req.Vault)
 	var resolved auth.ResolvedPlasticity
 	if e.authStore != nil {
-		vaultCfg, err := e.authStore.GetVaultConfig(req.Vault)
+		vaultCfg, err := e.authStore.GetVaultConfig(vaultName)
 		if err == nil {
 			resolved = auth.ResolvePlasticity(vaultCfg.Plasticity)
 		} else {
 			slog.Warn("plasticity: failed to read vault config, using defaults",
-				"vault", req.Vault, "err", err)
+				"vault", vaultName, "err", err)
 			resolved = auth.ResolvePlasticity(nil)
 		}
 	} else {
@@ -1551,7 +1548,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	}
 
 	// Build activation.ActivateRequest
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+	wsPrefix := e.resolveVaultPrefix(req.Vault)
 	e.activity.Record(wsPrefix)
 	vaultSize := e.store.GetVaultCount(ctx, wsPrefix)
 	vaultID := wsVaultID(wsPrefix)
@@ -1898,7 +1895,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	if e.latencyTracker != nil {
 		e.latencyTracker.Record(wsPrefix, "activate", d)
 	}
-	metrics.ActivateDuration.WithLabelValues(req.Vault).Observe(d.Seconds())
+	metrics.ActivateDuration.WithLabelValues(vaultName).Observe(d.Seconds())
 
 	return &mbp.ActivateResponse{
 		QueryID:     e.fastQueryID(),
@@ -1934,7 +1931,7 @@ func (e *Engine) SubscribeWithDeliver(ctx context.Context, req *mbp.SubscribeReq
 	// already used in storage/impl.go (binary.BigEndian.Uint32(wsPrefix[:4])).
 	// This is a compact routing key; the full 8-byte prefix is preserved in the
 	// workspace prefix used for storage lookups.
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+	wsPrefix := e.resolveVaultPrefix(req.Vault)
 	vaultID := wsVaultID(wsPrefix)
 
 	sub := &trigger.Subscription{
@@ -1963,7 +1960,7 @@ func (e *Engine) Unsubscribe(ctx context.Context, subID string) error {
 
 // Link implements mbp.EngineAPI.Link.
 func (e *Engine) Link(ctx context.Context, req *mbp.LinkRequest) (*mbp.LinkResponse, error) {
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+	wsPrefix := e.resolveVaultPrefix(req.Vault)
 
 	sourceID, err := storage.ParseULID(req.SourceID)
 	if err != nil {
@@ -2070,7 +2067,7 @@ func (e *Engine) Link(ctx context.Context, req *mbp.LinkRequest) (*mbp.LinkRespo
 
 // Forget implements mbp.EngineAPI.Forget.
 func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.ForgetResponse, error) {
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+	wsPrefix := e.resolveVaultPrefix(req.Vault)
 
 	id, err := storage.ParseULID(req.ID)
 	if err != nil {
@@ -2146,7 +2143,7 @@ func (e *Engine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatRespo
 
 	engramCount := e.engramCount.Load()
 	if req.Vault != "" {
-		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+		wsPrefix := e.resolveVaultPrefix(req.Vault)
 		engramCount = e.store.GetVaultCount(ctx, wsPrefix)
 	}
 
@@ -2254,7 +2251,7 @@ func (e *Engine) WorkerStats() cognitive.EngineWorkerStats {
 // Restore un-deletes a soft-deleted engram by restoring its state to StateActive.
 // Returns an error if the engram does not exist or was hard-deleted.
 func (e *Engine) Restore(ctx context.Context, vault, id string) (*storage.Engram, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	ulid, err := storage.ParseULID(id)
 	if err != nil {
 		return nil, fmt.Errorf("parse id: %w", err)
@@ -2287,7 +2284,7 @@ func (e *Engine) Restore(ctx context.Context, vault, id string) (*storage.Engram
 
 // UpdateLifecycleState transitions an engram to the named lifecycle state.
 func (e *Engine) UpdateLifecycleState(ctx context.Context, vault, id, state string) error {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	ulid, err := storage.ParseULID(id)
 	if err != nil {
 		return fmt.Errorf("parse id: %w", err)
@@ -2314,7 +2311,7 @@ func (e *Engine) UpdateLifecycleState(ctx context.Context, vault, id, state stri
 
 // ListDeleted returns soft-deleted engrams in the vault, up to limit.
 func (e *Engine) ListDeleted(ctx context.Context, vault string, limit int) ([]*storage.Engram, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	ids, err := e.store.ListByState(ctx, ws, storage.StateSoftDeleted, limit)
 	if err != nil {
 		return nil, err
@@ -2390,12 +2387,15 @@ type EngineSessionEntry struct {
 // All three writes (new engram, supersedes association, old engram state) are committed
 // in a single atomic Pebble batch so a crash cannot leave the store in an inconsistent state.
 func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason string) (storage.ULID, error) {
-	wsPrefix := e.store.ResolveVaultPrefix(vault)
-
 	// Parse the old ULID before any writes.
 	oldULID, err := storage.ParseULID(oldID)
 	if err != nil {
 		return storage.ULID{}, fmt.Errorf("evolve: parse old id: %w", err)
+	}
+	vaultName := canonicalVaultName(vault)
+	wsPrefix, err := e.resolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return storage.ULID{}, fmt.Errorf("evolve: resolve persisted workspace: %w", err)
 	}
 
 	// Read the old engram to inherit Concept and Tags.
@@ -2449,11 +2449,6 @@ func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason st
 	}
 	if err := batch.Commit(); err != nil {
 		return storage.ULID{}, fmt.Errorf("evolve: batch commit: %w", err)
-	}
-
-	// Persist vault name (idempotent).
-	if err := e.store.WriteVaultName(wsPrefix, vault); err != nil {
-		slog.Warn("engine: failed to persist vault name", "vault", vault, "err", err)
 	}
 
 	// Submit new engram to async FTS worker.
@@ -2520,7 +2515,7 @@ type SessionPagedResult struct {
 
 // SessionPaged returns engrams created since the given time with offset/limit pagination.
 func (e *Engine) SessionPaged(ctx context.Context, vault string, since time.Time, offset, limit int) (*SessionPagedResult, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	// Fetch one extra to know if there are more pages.
 	engrams, err := e.store.EngramsByCreatedSince(ctx, ws, since, offset, limit)
 	if err != nil {
@@ -2585,7 +2580,7 @@ func (e *Engine) Decide(ctx context.Context, vault, decision, rationale string, 
 // RecordAccess increments the access count and updates the last-accessed timestamp
 // for the engram identified by id in the given vault.
 func (e *Engine) RecordAccess(ctx context.Context, vault, id string) error {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	ulid, err := storage.ParseULID(id)
 	if err != nil {
 		return fmt.Errorf("record_access: parse id: %w", err)
@@ -2609,6 +2604,7 @@ func (e *Engine) RecordAccess(ctx context.Context, vault, id string) error {
 // ResolveVaultPlasticity returns the resolved plasticity config for a vault,
 // falling back to defaults when no authStore is configured.
 func (e *Engine) ResolveVaultPlasticity(vaultName string) auth.ResolvedPlasticity {
+	vaultName = canonicalVaultName(vaultName)
 	if e.authStore != nil {
 		vaultCfg, err := e.authStore.GetVaultConfig(vaultName)
 		if err == nil {
@@ -2623,6 +2619,7 @@ func (e *Engine) ResolveVaultPlasticity(vaultName string) auth.ResolvedPlasticit
 // persist in the relevance bucket index and cause an infinite prune loop.
 // Returns the number of engrams pruned.
 func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error) {
+	vaultName = canonicalVaultName(vaultName)
 	mu := e.getVaultMutex(vaultName)
 	mu.Lock()
 	defer mu.Unlock()
@@ -2952,7 +2949,7 @@ func sourceTypeString(st provenance.SourceType) string {
 
 // GetProvenance returns the ordered provenance log for an engram by ID.
 func (e *Engine) GetProvenance(ctx context.Context, vault, id string) ([]provenance.ProvenanceEntry, error) {
-	wsPrefix := e.store.ResolveVaultPrefix(vault)
+	wsPrefix := e.resolveVaultPrefix(vault)
 	ulid, err := storage.ParseULID(id)
 	if err != nil {
 		return nil, fmt.Errorf("parse id: %w", err)
@@ -2964,7 +2961,7 @@ func (e *Engine) GetProvenance(ctx context.Context, vault, id string) ([]provena
 // useful=false signals negative feedback (retrieved but not helpful);
 // useful=true signals positive feedback (retrieved and helpful).
 func (e *Engine) RecordFeedback(ctx context.Context, vault, engramID string, useful bool) error {
-	wsPrefix := e.store.ResolveVaultPrefix(vault)
+	wsPrefix := e.resolveVaultPrefix(vault)
 	ulid, err := storage.ParseULID(engramID)
 	if err != nil {
 		return fmt.Errorf("parse id: %w", err)

@@ -16,7 +16,7 @@ func (e *Engine) WhereLeftOff(ctx context.Context, vault string, limit int) ([]*
 	if limit > 50 {
 		limit = 50
 	}
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	var results []*storage.Engram
 	err := e.store.ScanLastAccessDesc(ctx, ws, func(id storage.ULID, _ int64) error {
 		if len(results) >= limit {

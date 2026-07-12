@@ -3,6 +3,7 @@ package grpc_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -728,7 +729,7 @@ func TestHello_Success(t *testing.T) {
 func TestHello_Error(t *testing.T) {
 	eng := &mockEngine{
 		helloFn: func(ctx context.Context, req *pb.HelloRequest) (*pb.HelloResponse, error) {
-			return nil, errors.New("engine down")
+			return nil, fmt.Errorf("hello: %w", storage.ErrVaultCatalogCorrupt)
 		},
 	}
 	srv := newPublicTestServer(t, eng)
@@ -736,6 +737,12 @@ func TestHello_Error(t *testing.T) {
 	_, err := srv.Hello(context.Background(), &pb.HelloRequest{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+	if status.Code(err) == codes.Unauthenticated {
+		t.Fatalf("catalog failure was mislabeled as authentication: %v", err)
+	}
+	if !errors.Is(err, storage.ErrVaultCatalogCorrupt) {
+		t.Fatalf("Hello error = %v, want catalog corruption", err)
 	}
 }
 

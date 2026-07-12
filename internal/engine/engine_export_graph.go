@@ -33,6 +33,7 @@ type ExportGraph struct {
 // If includeEngrams is true the entity type is enriched from the entity record table.
 // Edges are deduplicated by (From, To, RelType): only the highest-weight record per triple is kept.
 func (e *Engine) ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*ExportGraph, error) {
+	vault = canonicalVaultName(vault)
 	ws, err := e.resolveExistingVaultPrefix(vault)
 	if err != nil {
 		return nil, fmt.Errorf("export graph: resolve persisted workspace: %w", err)

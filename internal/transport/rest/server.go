@@ -580,9 +580,16 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body")
 		return
 	}
+	if err := mbp.ValidateHelloRequest(&req); err != nil {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
+		return
+	}
 	resp, err := s.engine.Hello(r.Context(), &req)
 	if err != nil {
-		s.sendError(r, w, http.StatusUnauthorized, ErrAuthFailed, err.Error())
+		// Public request parsing has already succeeded. Engine Hello now performs
+		// fail-closed catalog validation, so its failures are storage failures,
+		// not evidence that the caller supplied bad credentials.
+		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
 	s.sendJSON(w, http.StatusOK, resp)

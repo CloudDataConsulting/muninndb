@@ -50,6 +50,7 @@ var defaultReplayStages = []string{"entities", "relationships", "classification"
 // The method requires an EnrichPlugin to be registered via SetEnrichPlugin.
 // If no plugin is configured and dryRun is false, an error is returned.
 func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []string, limit int, dryRun bool) (*ReplayEnrichmentResult, error) {
+	vault = canonicalVaultName(vault)
 	if len(stages) == 0 {
 		stages = defaultReplayStages
 	}

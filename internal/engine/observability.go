@@ -25,7 +25,7 @@ type LLMStats struct {
 type ObservabilitySnapshot struct {
 	System     SystemStats                   `json:"system"`
 	Storage    StorageStats                  `json:"storage"`
-	Processors []ProcessorStats             `json:"processors"`
+	Processors []ProcessorStats              `json:"processors"`
 	Workers    WorkerStatsSnapshot           `json:"cognitive_workers"`
 	Vaults     map[string]VaultObservability `json:"vaults"`
 	LLM        *LLMStats                     `json:"llm,omitempty"`
@@ -199,7 +199,7 @@ func (e *Engine) Observability(ctx context.Context, version string, uptimeSecond
 
 	vaults := make(map[string]VaultObservability, len(vaultNames))
 	for _, name := range vaultNames {
-		wsPrefix := e.store.ResolveVaultPrefix(name)
+		wsPrefix := e.resolveVaultPrefix(name)
 		count := e.store.GetVaultCount(ctx, wsPrefix)
 
 		var vectors int

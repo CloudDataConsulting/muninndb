@@ -122,7 +122,11 @@ func (e *Engine) RememberTree(ctx context.Context, req *RememberTreeRequest) (*R
 	if err := validateTreeNode(req.Root, 0); err != nil {
 		return nil, fmt.Errorf("RememberTree: %w", err)
 	}
-	ws := e.store.ResolveVaultPrefix(req.Vault)
+	vaultName := canonicalVaultName(req.Vault)
+	ws, err := e.resolveOrCreateVaultPrefix(vaultName)
+	if err != nil {
+		return nil, fmt.Errorf("RememberTree: %w", err)
+	}
 	items := flattenTree(req.Root)
 
 	// Build storage.Engram objects for every node.
@@ -198,7 +202,7 @@ func (e *Engine) RememberTree(ctx context.Context, req *RememberTreeRequest) (*R
 // ordinal index. This is safe to call after a soft-delete of the parent because
 // soft-delete does not clean up ordinal keys where the deleted engram is the parent.
 func (e *Engine) CountChildren(ctx context.Context, vault, engramID string) (int, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 	pid, err := storage.ParseULID(engramID)
 	if err != nil {
 		return 0, fmt.Errorf("count children: parse id: %w", err)
@@ -218,10 +222,14 @@ func (e *Engine) AddChild(ctx context.Context, vault, parentID string, input *Ad
 	if input == nil {
 		return nil, fmt.Errorf("add child: input must not be nil")
 	}
-	ws := e.store.ResolveVaultPrefix(vault)
 	pid, err := storage.ParseULID(parentID)
 	if err != nil {
 		return nil, fmt.Errorf("add child: parse parent id: %w", err)
+	}
+	vaultName := canonicalVaultName(vault)
+	ws, err := e.resolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return nil, fmt.Errorf("add child: resolve persisted workspace: %w", err)
 	}
 
 	// Verify parent exists and is active or archived.
@@ -308,11 +316,6 @@ func (e *Engine) AddChild(ctx context.Context, vault, parentID string, input *Ad
 
 	// Post-commit side effects (async, non-critical for crash-safety).
 	// These mirror what e.Write() triggers after the storage write.
-	vaultName := vault
-	if vaultName == "" {
-		vaultName = "default"
-	}
-	_ = e.store.WriteVaultName(ws, vaultName)
 	e.activity.Record(ws)
 
 	if e.ftsWorker != nil {
@@ -360,7 +363,7 @@ func lifecycleStateString(s storage.LifecycleState) string {
 // limit caps the number of children fetched per node at each level — it is not a
 // global cap on total output nodes. maxDepth=0 means unlimited depth.
 func (e *Engine) RecallTree(ctx context.Context, vault, rootID string, maxDepth, limit int, includeCompleted bool) (*TreeNode, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws := e.resolveVaultPrefix(vault)
 
 	id, err := storage.ParseULID(rootID)
 	if err != nil {

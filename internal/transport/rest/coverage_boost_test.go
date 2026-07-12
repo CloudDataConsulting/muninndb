@@ -441,25 +441,53 @@ func TestHandleHello_InvalidJSON_Boost(t *testing.T) {
 	}
 }
 
+func TestHandleHello_InvalidFields(t *testing.T) {
+	eng := &MockEngine{}
+	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("POST", "/api/hello", strings.NewReader(`{"version":"99","auth_method":"none"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var response ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != ErrInvalidEngram {
+		t.Fatalf("error code = %d, want %d", response.Error.Code, ErrInvalidEngram)
+	}
+}
+
 func TestHandleHello_EngineError(t *testing.T) {
 	eng := &helloErrorEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	body := `{"vault":"default"}`
+	body := `{"version":"1","auth_method":"none","vault":"default"}`
 	req := httptest.NewRequest("POST", "/api/hello", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d", w.Code)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	var response ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != ErrStorageError {
+		t.Fatalf("error code = %d, want %d", response.Error.Code, ErrStorageError)
 	}
 }
 
 type helloErrorEngine struct{ MockEngine }
 
 func (e *helloErrorEngine) Hello(_ context.Context, _ *HelloRequest) (*HelloResponse, error) {
-	return nil, errors.New("auth failed")
+	return nil, fmt.Errorf("hello: %w", storage.ErrVaultCatalogCorrupt)
 }
 
 // ---------------------------------------------------------------------------
@@ -989,7 +1017,7 @@ func TestHandleHello_Success(t *testing.T) {
 	eng := &MockEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	body := `{"vault":"default"}`
+	body := `{"version":"1","auth_method":"none","vault":"default"}`
 	req := httptest.NewRequest("POST", "/api/hello", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
