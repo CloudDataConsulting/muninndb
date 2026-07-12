@@ -61,11 +61,11 @@ vault: default
 
 ### Key modes
 
-| Mode | Reads | Cognitive state writes | Use case |
-|------|-------|------------------------|----------|
-| `full` | Yes | **Yes** — temporal scores refresh, Hebbian weights update, access counts increment | AI agents, primary integrations, anything that is *part of* the brain |
-| `observe` | Yes | **No** — mutating REST routes return `403` before the engine is reached; engine-layer cognitive mutations are also suppressed | Dashboards, analytics, read-only partners, exports |
-| `write` | **No** — read and data-returning mutation routes return `403` | **Explicit writes only** — ingest-only mutations that do not return vault data remain available | Ingestion pipelines that must not read vault contents |
+| Mode | Reads | Data mutations | Cognitive side effects | Use case |
+|------|-------|----------------|------------------------|----------|
+| `full` | Yes | Yes | **Yes** — temporal scores refresh, Hebbian weights update, access counts increment | AI agents, primary integrations, anything that is *part of* the brain |
+| `observe` | Yes | **No** — mutating REST routes return `403`, and MBP mutations are denied before the engine is reached | **No** — scores are computed but nothing is persisted | Dashboards, analytics, read-only partners, exports |
+| `write` | **No** — reads and data-returning mutation routes return `403` | **Explicit writes only** — ingest-only mutations that do not return vault data remain available | No read-triggered effects | Ingestion pipelines that must not read vault contents |
 
 The `observe` mode exists because the vault's cognitive state is the thing of value. A dashboard reading engrams 1000 times a day should not inflate access counts and distort what the AI agent sees as relevant. `observe` keys see the brain; they don't affect it, and semantically mutating REST routes are rejected.
 
@@ -92,6 +92,43 @@ curl http://127.0.0.1:8475/api/engrams?vault=default \
 
 The key implicitly identifies the vault. If the key belongs to `default` and the request specifies a different vault, the request is rejected.
 For body-based REST routes, the vault must be supplied as `?vault=`. Some routes allow vault to be in the JSON body for compatibility but this will be deprecated soon. If both are present, they must match.
+
+### MBP connection authorization
+
+The native MBP transport authenticates once during `HELLO`, then pins the
+connection to that exact vault and key mode. Empty request vaults resolve to the
+connection vault; a different vault is rejected. The server revalidates the key
+and its immutable vault/mode/expiry claims before every frame, so revocation or
+expiry applies to an already-open connection. Anonymous MBP sessions require an
+explicitly public vault, use that vault's documented full read/write behavior,
+and are denied on their next frame—or disconnected by the idle monitor—if the
+vault is locked.
+
+MBP passes `observe` and `write` mode through the same engine context used by
+other transports. Transport enforcement denies direct mutations for `observe`
+and read operations for `write`. The engine-level observe hardening (including
+passive read/activation behavior and a non-persisting observe `HELLO`) and
+vault-scoped statistics must land with this transport change; MBP authorization
+alone does not make those engine operations passive or their responses scoped.
+
+#### MBP v1 migration notes
+
+This is a fail-closed security correction without a frame-shape or protocol
+version change. Existing MBP v1 clients must make these adjustments:
+
+- Put the intended vault in `HELLO`. A client that connects to the default vault
+  can no longer switch to another public vault in later request payloads.
+- Set `auth_method: "token"` whenever a token is supplied. A token paired with
+  omitted or `none` auth is rejected instead of being silently ignored.
+- Leave `subscription_id` empty on subscribe. The server assigns the ID returned
+  by `SUB_OK`; only that connection may unsubscribe it.
+- Do not use `FlagVault` as an override. It remains parseable for wire
+  compatibility, but every payload vault must be empty or equal the vault bound
+  during `HELLO`.
+
+After revocation, expiry, a key-claim change, or locking an anonymous session's
+vault, the server terminates the connection and removes its subscriptions. Idle
+connections are rechecked periodically (and exactly at known key expiry).
 
 ---
 

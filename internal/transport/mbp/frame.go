@@ -27,7 +27,7 @@ const (
 	FlagCompressed uint16 = 1 << 0 // payload is zstd compressed
 	FlagStreaming  uint16 = 1 << 1 // part of a multi-frame response
 	FlagLastFrame  uint16 = 1 << 2 // final frame in streaming response
-	FlagVault      uint16 = 1 << 3 // vault override in payload
+	FlagVault      uint16 = 1 << 3 // legacy vault marker; never overrides the HELLO-bound vault
 	FlagUrgent     uint16 = 1 << 4 // process before queued commands
 )
 

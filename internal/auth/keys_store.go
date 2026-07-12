@@ -19,6 +19,10 @@ var ErrKeyNotFound = errors.New("api key not found")
 // Returns the raw token (shown once) and the key metadata.
 // expiresAt is optional; pass nil for a key that never expires.
 func (s *Store) GenerateAPIKey(vault, label, mode string, expiresAt *time.Time) (token string, key APIKey, err error) {
+	if !ValidVaultName(vault) {
+		err = fmt.Errorf("invalid vault name")
+		return
+	}
 	if mode != ModeFull && mode != ModeObserve && mode != ModeWrite {
 		err = fmt.Errorf("mode must be %q, %q, or %q", ModeFull, ModeObserve, ModeWrite)
 		return
@@ -86,6 +90,12 @@ func (s *Store) ValidateAPIKey(token string) (APIKey, error) {
 	var key APIKey
 	if err := json.Unmarshal(data, &key); err != nil {
 		return APIKey{}, fmt.Errorf("corrupt key record: %w", err)
+	}
+	if !ValidVaultName(key.Vault) {
+		return APIKey{}, fmt.Errorf("corrupt api key vault scope")
+	}
+	if key.Mode != ModeFull && key.Mode != ModeObserve && key.Mode != ModeWrite {
+		return APIKey{}, fmt.Errorf("corrupt api key mode")
 	}
 	if key.ExpiresAt != nil && time.Now().After(*key.ExpiresAt) {
 		return APIKey{}, fmt.Errorf("api key has expired")

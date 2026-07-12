@@ -33,6 +33,11 @@ func ValidateHelloRequest(req *HelloRequest) error {
 	if req.AuthMethod == "token" && req.Token == "" {
 		return fmt.Errorf("token required when auth_method is token")
 	}
+	// Reject credential confusion instead of silently downgrading a request that
+	// supplied a token while declaring (or defaulting to) unauthenticated mode.
+	if req.AuthMethod == "none" && req.Token != "" {
+		return fmt.Errorf("token must be empty when auth_method is none")
+	}
 
 	return nil
 }

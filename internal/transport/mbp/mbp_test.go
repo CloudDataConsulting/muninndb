@@ -10,6 +10,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
+	"github.com/scrypster/muninndb/internal/auth"
 )
 
 // ---------------------------------------------------------------------------
@@ -39,8 +43,8 @@ func (e *stubEngine) Activate(_ context.Context, _ *ActivateRequest) (*ActivateR
 	return &ActivateResponse{QueryID: "q1"}, nil
 }
 
-func (e *stubEngine) Subscribe(_ context.Context, _ *SubscribeRequest) (*SubscribeResponse, error) {
-	return &SubscribeResponse{SubID: "s1", Status: "active"}, nil
+func (e *stubEngine) Subscribe(_ context.Context, req *SubscribeRequest) (*SubscribeResponse, error) {
+	return &SubscribeResponse{SubID: req.SubscriptionID, Status: "active"}, nil
 }
 
 func (e *stubEngine) Unsubscribe(_ context.Context, _ string) error { return nil }
@@ -61,8 +65,18 @@ func (e *stubEngine) Stat(_ context.Context, _ *StatRequest) (*StatResponse, err
 // Test helpers
 // ---------------------------------------------------------------------------
 
-func newTestServer(eng EngineAPI) *Server {
-	return &Server{engine: eng, shutdown: make(chan struct{})}
+func newTestServer(t *testing.T, eng EngineAPI) *Server {
+	t.Helper()
+	db, err := pebble.Open("", &pebble.Options{FS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("open test auth db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store := auth.NewStore(db)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("configure public default vault: %v", err)
+	}
+	return &Server{engine: eng, authStore: store, shutdown: make(chan struct{})}
 }
 
 func startTestConn(t *testing.T, s *Server) (client net.Conn, wait func()) {
@@ -167,6 +181,7 @@ func TestValidateHelloRequest(t *testing.T) {
 		{"empty version", HelloRequest{}, "invalid version"},
 		{"bad auth method", HelloRequest{Version: "1", AuthMethod: "kerberos"}, "invalid auth_method"},
 		{"token missing", HelloRequest{Version: "1", AuthMethod: "token"}, "token required"},
+		{"none with token", HelloRequest{Version: "1", AuthMethod: "none", Token: "ignored"}, "token must be empty"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -623,7 +638,7 @@ func TestProtocolVersionConstants(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServer_DispatchAllHandlers(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 	doHandshake(t, c)
@@ -639,7 +654,8 @@ func TestServer_DispatchAllHandlers(t *testing.T) {
 		{"read", TypeRead, TypeReadResp, &ReadRequest{ID: "e-1"}},
 		{"activate", TypeActivate, TypeActivateResp, &ActivateRequest{Context: []string{"q"}}},
 		{"subscribe", TypeSubscribe, TypeSubOK, &SubscribeRequest{Context: []string{"q"}}},
-		{"unsub", TypeUnsub, TypeUnsubOK, &UnsubscribeRequest{SubID: "s-1"}},
+		// The subscription ID is server-generated and not known until the prior
+		// response, so ownership behavior is covered in vault_auth_test.go.
 		{"link", TypeLink, TypeLinkOK, &LinkRequest{SourceID: "a", TargetID: "b"}},
 		{"forget", TypeForget, TypeForgetOK, &ForgetRequest{ID: "e-1"}},
 		{"stat", TypeStat, TypeStatResp, &StatRequest{}},
@@ -659,7 +675,7 @@ func TestServer_DispatchAllHandlers(t *testing.T) {
 }
 
 func TestServer_PingEchoData(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 	doHandshake(t, c)
@@ -678,7 +694,7 @@ func TestServer_PingEchoData(t *testing.T) {
 }
 
 func TestServer_EngineError(t *testing.T) {
-	s := newTestServer(&stubEngine{writeErr: fmt.Errorf("disk full")})
+	s := newTestServer(t, &stubEngine{writeErr: fmt.Errorf("disk full")})
 	c, wait := startTestConn(t, s)
 	defer wait()
 	doHandshake(t, c)
@@ -700,7 +716,7 @@ func TestServer_EngineError(t *testing.T) {
 }
 
 func TestServer_InvalidPayload(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 	doHandshake(t, c)
@@ -720,7 +736,7 @@ func TestServer_InvalidPayload(t *testing.T) {
 }
 
 func TestServer_UnknownFrameType(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 	doHandshake(t, c)
@@ -747,7 +763,7 @@ func TestServer_UnknownFrameType(t *testing.T) {
 }
 
 func TestServer_NonHelloFirst(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 
@@ -774,7 +790,7 @@ func TestServer_NonHelloFirst(t *testing.T) {
 }
 
 func TestServer_InvalidHelloPayload(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 
@@ -793,7 +809,7 @@ func TestServer_InvalidHelloPayload(t *testing.T) {
 }
 
 func TestServer_HelloBadVersion(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 
@@ -821,7 +837,7 @@ func TestServer_HelloBadVersion(t *testing.T) {
 }
 
 func TestServer_WriteResponsePayload(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 	doHandshake(t, c)
@@ -843,7 +859,7 @@ func TestServer_WriteResponsePayload(t *testing.T) {
 }
 
 func TestServer_StatResponsePayload(t *testing.T) {
-	s := newTestServer(&stubEngine{})
+	s := newTestServer(t, &stubEngine{})
 	c, wait := startTestConn(t, s)
 	defer wait()
 	doHandshake(t, c)

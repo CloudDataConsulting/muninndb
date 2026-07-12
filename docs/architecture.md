@@ -272,6 +272,18 @@ MessagePack payload. The correlation ID enables pipelining — a client can send
 
 22 message types covering all CRUD operations, ACTIVATE, subscription management, and admin commands. This is the lowest-latency protocol. Use it for any client where you control the implementation.
 
+Every MBP connection begins with `HELLO`. A token-authenticated connection is
+pinned to the API key's vault and mode; an unauthenticated connection is accepted
+only for an explicitly public vault and retains that vault's open read/write
+behavior. Credentials and public-vault policy are revalidated on every frame, so
+revocation, expiry, or locking a vault takes effect without reconnecting. Request
+payloads cannot override the connection vault. Subscription IDs are assigned by
+the server, owned by one connection, and cleaned up when that connection closes.
+Compressed request frames are accepted only when negotiated in `HELLO`, and
+their decoded payload is bounded to the normal 16 MiB MBP frame limit. The MBP
+transport, rather than the engine adapter, owns the negotiated capability list
+and advertised wire limits.
+
 ### gRPC — Port 8477
 
 Protocol buffers over HTTP/2. Streaming and unary RPCs for all core operations: Write, BatchWrite, Read, Activate, Link, Forget, Stat, Subscribe. API key authentication via "authorization" Bearer token or "x-api-key" metadata header. Supports keepalive, automatic reconnection, and multiplexing over a single HTTP/2 connection. Medium latency; excellent for polyglot systems with gRPC tooling available.
