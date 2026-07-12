@@ -3,7 +3,10 @@ package grpc_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -323,7 +326,7 @@ func TestAuthUnaryInterceptor_ValidKey(t *testing.T) {
 	md := metadata.Pairs("authorization", "Bearer "+token)
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
-	resp, err := srv.TestableAuthUnaryInterceptor(ctx, nil, nil, handler)
+	resp, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.WriteRequest{Vault: "testvault"}, nil, handler)
 	if err != nil {
 		t.Fatalf("interceptor returned error: %v", err)
 	}
@@ -359,7 +362,7 @@ func TestAuthUnaryInterceptor_InvalidKey(t *testing.T) {
 	md := metadata.Pairs("x-api-key", "mk_not-a-valid-base64-token!!")
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
-	_, err := srv.TestableAuthUnaryInterceptor(ctx, nil, nil, handler)
+	_, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.HelloRequest{}, nil, handler)
 	if err == nil {
 		t.Fatal("expected error for invalid key, got nil")
 	}
@@ -372,9 +375,35 @@ func TestAuthUnaryInterceptor_InvalidKey(t *testing.T) {
 	}
 }
 
+func TestAuthUnaryInterceptor_ExplicitEmptyCredentialIsRejected(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called with an empty credential")
+		return nil, nil
+	}
+
+	for name, md := range map[string]metadata.MD{
+		"empty authorization": metadata.Pairs("authorization", ""),
+		"empty bearer":        metadata.Pairs("authorization", "Bearer "),
+		"empty x-api-key":     metadata.Pairs("x-api-key", ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := metadata.NewIncomingContext(context.Background(), md)
+			_, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.HelloRequest{}, nil, handler)
+			if status.Code(err) != codes.Unauthenticated {
+				t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
+			}
+		})
+	}
+}
+
 // TestAuthUnaryInterceptor_NoKeyPublicVault configures the default vault as
 // public, sends a request without any auth metadata, and verifies the handler
-// is called with vault "default" and mode "observe".
+// is called with vault "default" and mode "full".
 func TestAuthUnaryInterceptor_NoKeyPublicVault(t *testing.T) {
 	store := newTestAuthStore(t)
 	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
@@ -391,7 +420,7 @@ func TestAuthUnaryInterceptor_NoKeyPublicVault(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	resp, err := srv.TestableAuthUnaryInterceptor(ctx, nil, nil, handler)
+	resp, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.HelloRequest{}, nil, handler)
 	if err != nil {
 		t.Fatalf("interceptor returned error: %v", err)
 	}
@@ -401,8 +430,8 @@ func TestAuthUnaryInterceptor_NoKeyPublicVault(t *testing.T) {
 	if capturedVault != "default" {
 		t.Errorf("vault = %q, want \"default\"", capturedVault)
 	}
-	if capturedMode != "observe" {
-		t.Errorf("mode = %q, want \"observe\"", capturedMode)
+	if capturedMode != "full" {
+		t.Errorf("mode = %q, want \"full\"", capturedMode)
 	}
 }
 
@@ -423,7 +452,7 @@ func TestAuthUnaryInterceptor_NoKeyLockedVault(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err := srv.TestableAuthUnaryInterceptor(ctx, nil, nil, handler)
+	_, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.HelloRequest{}, nil, handler)
 	if err == nil {
 		t.Fatal("expected error for locked vault, got nil")
 	}
@@ -450,7 +479,7 @@ func TestAuthUnaryInterceptor_MissingKeyStore(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err := srv.TestableAuthUnaryInterceptor(ctx, nil, nil, handler)
+	_, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.HelloRequest{}, nil, handler)
 	if err == nil {
 		t.Fatal("expected error for unconfigured vault (fail-closed), got nil")
 	}
@@ -463,35 +492,20 @@ func TestAuthUnaryInterceptor_MissingKeyStore(t *testing.T) {
 	}
 }
 
-// vaultRequest satisfies the vaultNamer interface used by authUnaryInterceptor.
-type vaultRequest struct{ vault string }
-
-func (v *vaultRequest) GetVault() string { return v.vault }
-
-// TestAuthUnaryInterceptor_VaultFromRequest verifies that authUnaryInterceptor
-// extracts the vault name from a request implementing GetVault().
-func TestAuthUnaryInterceptor_VaultFromRequest(t *testing.T) {
+func TestAuthUnaryInterceptor_UnsupportedRequestFailsClosed(t *testing.T) {
 	store := newTestAuthStore(t)
-	if err := store.SetVaultConfig(auth.VaultConfig{Name: "myvault", Public: true}); err != nil {
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
 		t.Fatalf("SetVaultConfig: %v", err)
 	}
-
 	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
-
-	var capturedVault string
-	handler := func(ctx context.Context, req any) (any, error) {
-		capturedVault, _ = ctx.Value(auth.ContextVault).(string)
-		return "ok", nil
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called for an unsupported request type")
+		return nil, nil
 	}
 
-	req := &vaultRequest{vault: "myvault"}
-	ctx := context.Background()
-	_, err := srv.TestableAuthUnaryInterceptor(ctx, req, nil, handler)
-	if err != nil {
-		t.Fatalf("interceptor returned error: %v", err)
-	}
-	if capturedVault != "myvault" {
-		t.Errorf("vault = %q, want \"myvault\"", capturedVault)
+	_, err := srv.TestableAuthUnaryInterceptor(context.Background(), struct{ Vault string }{Vault: "private"}, nil, handler)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (err=%v)", status.Code(err), err)
 	}
 }
 
@@ -515,12 +529,342 @@ func TestAuthUnaryInterceptor_XApiKeyHeader(t *testing.T) {
 	md := metadata.Pairs("x-api-key", token)
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
-	_, err = srv.TestableAuthUnaryInterceptor(ctx, nil, nil, handler)
+	_, err = srv.TestableAuthUnaryInterceptor(ctx, &pb.HelloRequest{}, nil, handler)
 	if err != nil {
 		t.Fatalf("interceptor returned error: %v", err)
 	}
 	if capturedMode != "full" {
 		t.Errorf("mode = %q, want \"full\"", capturedMode)
+	}
+}
+
+func TestAuthUnaryInterceptor_RejectsCrossVaultKey(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("vault-a", "test-label", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called for a cross-vault key")
+		return nil, nil
+	}
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs("authorization", "Bearer "+token),
+	)
+
+	_, err = srv.TestableAuthUnaryInterceptor(ctx, &pb.ReadRequest{Vault: "vault-b"}, nil, handler)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestAuthUnaryInterceptor_EmptyVaultUsesKeyVault(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("vault-a", "test-label", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	req := &pb.WriteRequest{}
+	handler := func(ctx context.Context, _ any) (any, error) {
+		if req.Vault != "vault-a" {
+			t.Errorf("request vault = %q, want vault-a", req.Vault)
+		}
+		if vault, _ := ctx.Value(auth.ContextVault).(string); vault != "vault-a" {
+			t.Errorf("context vault = %q, want vault-a", vault)
+		}
+		return "ok", nil
+	}
+
+	if _, err := srv.TestableAuthUnaryInterceptor(ctx, req, nil, handler); err != nil {
+		t.Fatalf("interceptor returned error: %v", err)
+	}
+}
+
+func TestAuthUnaryInterceptor_RejectsPrivateRequestWhenDefaultIsPublic(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig(default): %v", err)
+	}
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "private", Public: false}); err != nil {
+		t.Fatalf("SetVaultConfig(private): %v", err)
+	}
+
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called for a private vault")
+		return nil, nil
+	}
+
+	_, err := srv.TestableAuthUnaryInterceptor(
+		context.Background(),
+		&pb.WriteRequest{Vault: "private"},
+		nil,
+		handler,
+	)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestAuthUnaryInterceptor_RejectsMixedVaultBatch(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called for a mixed-vault batch")
+		return nil, nil
+	}
+
+	_, err := srv.TestableAuthUnaryInterceptor(
+		context.Background(),
+		&pb.BatchWriteRequest{Requests: []*pb.WriteRequest{
+			{Vault: "default"},
+			{Vault: "private"},
+		}},
+		nil,
+		handler,
+	)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestAuthUnaryInterceptor_RejectsNilBatchItem(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called for a nil batch item")
+		return nil, nil
+	}
+
+	_, err := srv.TestableAuthUnaryInterceptor(
+		context.Background(),
+		&pb.BatchWriteRequest{Requests: []*pb.WriteRequest{nil}},
+		nil,
+		handler,
+	)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestAuthUnaryInterceptor_CanonicalizesBatchVault(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	req := &pb.BatchWriteRequest{Requests: []*pb.WriteRequest{{Vault: ""}, {Vault: " default "}}}
+	handler := func(ctx context.Context, got any) (any, error) {
+		batch := got.(*pb.BatchWriteRequest)
+		for i, item := range batch.Requests {
+			if item.Vault != "default" {
+				t.Errorf("item %d vault = %q, want default", i, item.Vault)
+			}
+		}
+		if vault, _ := ctx.Value(auth.ContextVault).(string); vault != "default" {
+			t.Errorf("context vault = %q, want default", vault)
+		}
+		return "ok", nil
+	}
+
+	if _, err := srv.TestableAuthUnaryInterceptor(context.Background(), req, nil, handler); err != nil {
+		t.Fatalf("interceptor returned error: %v", err)
+	}
+}
+
+func TestAuthUnaryInterceptor_WriteOnlyCannotRead(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("default", "ingest", auth.ModeWrite, nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called for a write-only read")
+		return nil, nil
+	}
+
+	_, err = srv.TestableAuthUnaryInterceptor(ctx, &pb.ReadRequest{Vault: "default"}, nil, handler)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestAuthUnaryInterceptor_WriteOnlyCanWrite(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("default", "ingest", auth.ModeWrite, nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	called := false
+	handler := func(context.Context, any) (any, error) {
+		called = true
+		return "ok", nil
+	}
+
+	if _, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.WriteRequest{Vault: "default"}, nil, handler); err != nil {
+		t.Fatalf("interceptor returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("handler was not called")
+	}
+}
+
+func TestAuthUnaryInterceptor_ObserveCannotMutate(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("default", "observer", auth.ModeObserve, nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	handler := func(context.Context, any) (any, error) {
+		t.Fatal("handler should not be called for an observe-mode mutation")
+		return nil, nil
+	}
+
+	requests := []any{
+		&pb.WriteRequest{Vault: "default"},
+		&pb.BatchWriteRequest{Requests: []*pb.WriteRequest{{Vault: "default"}}},
+		&pb.ForgetRequest{Vault: "default"},
+		&pb.LinkRequest{Vault: "default"},
+	}
+	for _, req := range requests {
+		_, err := srv.TestableAuthUnaryInterceptor(ctx, req, nil, handler)
+		if status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("%T code = %v, want PermissionDenied (err=%v)", req, status.Code(err), err)
+		}
+	}
+}
+
+func TestAuthUnaryInterceptor_ObserveCanRead(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("default", "observer", auth.ModeObserve, nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	called := false
+	handler := func(context.Context, any) (any, error) {
+		called = true
+		return "ok", nil
+	}
+
+	if _, err := srv.TestableAuthUnaryInterceptor(ctx, &pb.ReadRequest{Vault: "default"}, nil, handler); err != nil {
+		t.Fatalf("interceptor returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("handler was not called")
+	}
+}
+
+func TestAuthUnaryInterceptor_PublicVaultCanWrite(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	called := false
+	handler := func(ctx context.Context, _ any) (any, error) {
+		called = true
+		if mode, _ := ctx.Value(auth.ContextMode).(string); mode != auth.ModeFull {
+			t.Errorf("mode = %q, want full", mode)
+		}
+		return "ok", nil
+	}
+
+	if _, err := srv.TestableAuthUnaryInterceptor(
+		context.Background(),
+		&pb.WriteRequest{Vault: "default"},
+		nil,
+		handler,
+	); err != nil {
+		t.Fatalf("interceptor returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("handler was not called")
+	}
+}
+
+func TestRPCHandlers_RejectCrossVaultWithoutInterceptor(t *testing.T) {
+	store := newTestAuthStore(t)
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	key := &auth.APIKey{Vault: "vault-a", Mode: auth.ModeFull}
+	ctx := context.WithValue(context.Background(), auth.ContextAPIKey, key)
+	ctx = context.WithValue(ctx, auth.ContextMode, auth.ModeFull)
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"hello", func() error {
+			_, err := srv.Hello(ctx, &pb.HelloRequest{Vault: "vault-b"})
+			return err
+		}},
+		{"write", func() error {
+			_, err := srv.Write(ctx, &pb.WriteRequest{Vault: "vault-b"})
+			return err
+		}},
+		{"batch-write", func() error {
+			_, err := srv.BatchWrite(ctx, &pb.BatchWriteRequest{Requests: []*pb.WriteRequest{{Vault: "vault-b"}}})
+			return err
+		}},
+		{"read", func() error {
+			_, err := srv.Read(ctx, &pb.ReadRequest{Vault: "vault-b"})
+			return err
+		}},
+		{"forget", func() error {
+			_, err := srv.Forget(ctx, &pb.ForgetRequest{Vault: "vault-b"})
+			return err
+		}},
+		{"stat", func() error {
+			_, err := srv.Stat(ctx, &pb.StatRequest{Vault: "vault-b"})
+			return err
+		}},
+		{"link", func() error {
+			_, err := srv.Link(ctx, &pb.LinkRequest{Vault: "vault-b"})
+			return err
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+			}
+		})
+	}
+
+	activateStream := &mockActivateStream{ctx: ctx}
+	if err := srv.Activate(&pb.ActivateRequest{Vault: "vault-b"}, activateStream); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("activate code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+	subscribeStream := &mockSubscribeStream{ctx: ctx, recvReq: &pb.SubscribeRequest{Vault: "vault-b"}}
+	if err := srv.Subscribe(subscribeStream); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("subscribe code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestRPCHandlers_NilAuthStoreFailsClosed(t *testing.T) {
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, nil, nil)
+	_, err := srv.Write(context.Background(), &pb.WriteRequest{Vault: "default"})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
 	}
 }
 
@@ -534,6 +878,7 @@ type mockServerStream struct {
 	sentMsgs []any
 	recvMsgs []any
 	recvIdx  int
+	recvFn   func(any) error
 }
 
 func (m *mockServerStream) SetHeader(metadata.MD) error  { return nil }
@@ -544,7 +889,12 @@ func (m *mockServerStream) SendMsg(msg any) error {
 	m.sentMsgs = append(m.sentMsgs, msg)
 	return nil
 }
-func (m *mockServerStream) RecvMsg(msg any) error { return nil }
+func (m *mockServerStream) RecvMsg(msg any) error {
+	if m.recvFn != nil {
+		return m.recvFn(msg)
+	}
+	return nil
+}
 
 func TestAuthStreamInterceptor_ValidKey(t *testing.T) {
 	store := newTestAuthStore(t)
@@ -557,6 +907,9 @@ func TestAuthStreamInterceptor_ValidKey(t *testing.T) {
 
 	var capturedVault, capturedMode string
 	handler := func(srv any, stream grpc.ServerStream) error {
+		if err := stream.RecvMsg(&pb.ActivateRequest{Vault: "testvault"}); err != nil {
+			return err
+		}
 		ctx := stream.Context()
 		capturedVault, _ = ctx.Value(auth.ContextVault).(string)
 		capturedMode, _ = ctx.Value(auth.ContextMode).(string)
@@ -615,6 +968,9 @@ func TestAuthStreamInterceptor_NoKeyPublicVault(t *testing.T) {
 
 	var capturedVault, capturedMode string
 	handler := func(srv any, stream grpc.ServerStream) error {
+		if err := stream.RecvMsg(&pb.ActivateRequest{Vault: "default"}); err != nil {
+			return err
+		}
 		ctx := stream.Context()
 		capturedVault, _ = ctx.Value(auth.ContextVault).(string)
 		capturedMode, _ = ctx.Value(auth.ContextMode).(string)
@@ -631,8 +987,8 @@ func TestAuthStreamInterceptor_NoKeyPublicVault(t *testing.T) {
 	if capturedVault != "default" {
 		t.Errorf("vault = %q, want \"default\"", capturedVault)
 	}
-	if capturedMode != "observe" {
-		t.Errorf("mode = %q, want \"observe\"", capturedMode)
+	if capturedMode != "full" {
+		t.Errorf("mode = %q, want \"full\"", capturedMode)
 	}
 }
 
@@ -641,8 +997,7 @@ func TestAuthStreamInterceptor_NoKeyLockedVault(t *testing.T) {
 	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
 
 	handler := func(srv any, stream grpc.ServerStream) error {
-		t.Fatal("handler should not be called for locked vault without auth")
-		return nil
+		return stream.RecvMsg(&pb.ActivateRequest{Vault: "default"})
 	}
 
 	ctx := context.Background()
@@ -672,6 +1027,9 @@ func TestAuthStreamInterceptor_XApiKey(t *testing.T) {
 
 	var capturedMode string
 	handler := func(srv any, stream grpc.ServerStream) error {
+		if err := stream.RecvMsg(&pb.ActivateRequest{Vault: "default"}); err != nil {
+			return err
+		}
 		ctx := stream.Context()
 		capturedMode, _ = ctx.Value(auth.ContextMode).(string)
 		return nil
@@ -687,6 +1045,250 @@ func TestAuthStreamInterceptor_XApiKey(t *testing.T) {
 	}
 	if capturedMode != "observe" {
 		t.Errorf("mode = %q, want \"observe\"", capturedMode)
+	}
+}
+
+func TestAuthStreamInterceptor_RejectsCrossVaultKey(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("vault-a", "test-label", "full", nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs("authorization", "Bearer "+token),
+	)
+	ss := &mockServerStream{ctx: ctx}
+	handler := func(_ any, stream grpc.ServerStream) error {
+		return stream.RecvMsg(&pb.ActivateRequest{Vault: "vault-b"})
+	}
+
+	err = srv.TestableAuthStreamInterceptor(nil, ss, nil, handler)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestAuthStreamInterceptor_UsesDecodedPublicVault(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: false}); err != nil {
+		t.Fatalf("SetVaultConfig(default): %v", err)
+	}
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "public-b", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig(public-b): %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ss := &mockServerStream{ctx: context.Background()}
+	var capturedVault string
+	handler := func(_ any, stream grpc.ServerStream) error {
+		if err := stream.RecvMsg(&pb.SubscribeRequest{Vault: "public-b"}); err != nil {
+			return err
+		}
+		capturedVault, _ = stream.Context().Value(auth.ContextVault).(string)
+		return nil
+	}
+
+	if err := srv.TestableAuthStreamInterceptor(nil, ss, nil, handler); err != nil {
+		t.Fatalf("interceptor returned error: %v", err)
+	}
+	if capturedVault != "public-b" {
+		t.Fatalf("vault = %q, want public-b", capturedVault)
+	}
+}
+
+func TestAuthStreamInterceptor_WriteOnlyCannotRead(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateAPIKey("default", "ingest", auth.ModeWrite, nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	ss := &mockServerStream{ctx: ctx}
+	handler := func(_ any, stream grpc.ServerStream) error {
+		return stream.RecvMsg(&pb.ActivateRequest{Vault: "default"})
+	}
+
+	err = srv.TestableAuthStreamInterceptor(nil, ss, nil, handler)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestAuthStreamInterceptor_RevokedKeyCancelsStream(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, key, err := store.GenerateAPIKey("default", "stream", auth.ModeFull, nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	srv.SetTestStreamAuthRecheckInterval(5 * time.Millisecond)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	ss := &mockServerStream{ctx: ctx}
+	ready := make(chan struct{})
+	handler := func(_ any, stream grpc.ServerStream) error {
+		if err := stream.RecvMsg(&pb.SubscribeRequest{Vault: "default"}); err != nil {
+			return err
+		}
+		close(ready)
+		<-stream.Context().Done()
+		return context.Cause(stream.Context())
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- srv.TestableAuthStreamInterceptor(nil, ss, nil, handler)
+	}()
+
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("stream was not authorized")
+	}
+	if err := store.RevokeAPIKey("default", key.ID); err != nil {
+		t.Fatalf("RevokeAPIKey: %v", err)
+	}
+	select {
+	case err := <-result:
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("revoked key did not cancel stream")
+	}
+}
+
+func TestAuthStreamInterceptor_ExpiredKeyCancelsStream(t *testing.T) {
+	store := newTestAuthStore(t)
+	expiresAt := time.Now().Add(300 * time.Millisecond)
+	token, _, err := store.GenerateAPIKey("default", "stream", auth.ModeFull, &expiresAt)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+	srv.SetTestStreamAuthRecheckInterval(5 * time.Millisecond)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", token))
+	ss := &mockServerStream{ctx: ctx}
+	ready := make(chan struct{})
+	handler := func(_ any, stream grpc.ServerStream) error {
+		if err := stream.RecvMsg(&pb.SubscribeRequest{Vault: "default"}); err != nil {
+			return err
+		}
+		close(ready)
+		<-stream.Context().Done()
+		return context.Cause(stream.Context())
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- srv.TestableAuthStreamInterceptor(nil, ss, nil, handler)
+	}()
+	select {
+	case <-ready:
+	case err := <-result:
+		t.Fatalf("stream was not initially authorized: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("stream was not initially authorized")
+	}
+	select {
+	case err := <-result:
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired key did not cancel stream")
+	}
+}
+
+func TestAuthStreamInterceptor_CancellationWhileFirstMessageBlocked(t *testing.T) {
+	tests := []struct {
+		name   string
+		cancel func(*auth.Store, auth.APIKey)
+		expiry time.Duration
+	}{
+		{
+			name: "revoked",
+			cancel: func(store *auth.Store, key auth.APIKey) {
+				if err := store.RevokeAPIKey("default", key.ID); err != nil {
+					t.Fatalf("RevokeAPIKey: %v", err)
+				}
+			},
+		},
+		{name: "expired", expiry: 300 * time.Millisecond},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestAuthStore(t)
+			var expiresAt *time.Time
+			if tc.expiry > 0 {
+				deadline := time.Now().Add(tc.expiry)
+				expiresAt = &deadline
+			}
+			token, key, err := store.GenerateAPIKey("default", "stream", auth.ModeFull, expiresAt)
+			if err != nil {
+				t.Fatalf("GenerateAPIKey: %v", err)
+			}
+			srv := transportgrpc.NewServer(":0", &mockEngine{}, store, nil)
+			srv.SetTestStreamAuthRecheckInterval(5 * time.Millisecond)
+
+			enteredRecv := make(chan struct{})
+			releaseRecv := make(chan struct{})
+			ss := &mockServerStream{
+				ctx: metadata.NewIncomingContext(
+					context.Background(),
+					metadata.Pairs("x-api-key", token),
+				),
+				recvFn: func(any) error {
+					close(enteredRecv)
+					<-releaseRecv
+					return nil
+				},
+			}
+			streamCtx := make(chan context.Context, 1)
+			handlerCalled := make(chan struct{})
+			handler := func(_ any, stream grpc.ServerStream) error {
+				close(handlerCalled)
+				streamCtx <- stream.Context()
+				return stream.RecvMsg(&pb.SubscribeRequest{Vault: "default"})
+			}
+			result := make(chan error, 1)
+			go func() {
+				result <- srv.TestableAuthStreamInterceptor(nil, ss, nil, handler)
+			}()
+
+			select {
+			case <-handlerCalled:
+			case err := <-result:
+				t.Fatalf("stream did not authenticate initially: %v", err)
+			case <-time.After(time.Second):
+				t.Fatal("stream did not authenticate initially")
+			}
+			ctx := <-streamCtx
+			select {
+			case <-enteredRecv:
+			case <-time.After(time.Second):
+				t.Fatal("first message did not block in RecvMsg")
+			}
+			if tc.cancel != nil {
+				tc.cancel(store, key)
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+				t.Fatal("stream credentials were not invalidated")
+			}
+			close(releaseRecv)
+
+			select {
+			case err := <-result:
+				if status.Code(err) != codes.Unauthenticated {
+					t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("blocked first message did not fail after credential invalidation")
+			}
+		})
 	}
 }
 
@@ -1012,6 +1614,222 @@ type mockSubscribeStream struct {
 	sendErr error
 }
 
+type cancelOnConfirmSubscribeStream struct {
+	grpc.ServerStream
+	ctx    context.Context
+	cancel context.CancelFunc
+	req    *pb.SubscribeRequest
+	once   sync.Once
+}
+
+func (m *cancelOnConfirmSubscribeStream) Context() context.Context { return m.ctx }
+func (m *cancelOnConfirmSubscribeStream) Recv() (*pb.SubscribeRequest, error) {
+	return m.req, nil
+}
+func (m *cancelOnConfirmSubscribeStream) Send(push *pb.ActivationPush) error {
+	if push.Trigger == "subscription_created" {
+		m.once.Do(m.cancel)
+	}
+	return nil
+}
+
+func TestSubscribe_RejectsConcurrentClientAssignedIDAcrossVaults(t *testing.T) {
+	store := newTestAuthStore(t)
+	for _, vault := range []string{"vault-a", "vault-b"} {
+		if err := store.SetVaultConfig(auth.VaultConfig{Name: vault, Public: true}); err != nil {
+			t.Fatalf("SetVaultConfig(%s): %v", vault, err)
+		}
+	}
+
+	var subscribeCalls atomic.Int64
+	var unsubscribeCalls atomic.Int64
+	eng := &mockEngine{
+		subscribeWithDeliverFn: func(context.Context, *pb.SubscribeRequest, trigger.DeliverFunc) (string, error) {
+			subscribeCalls.Add(1)
+			return "", errors.New("engine must not receive a client-assigned subscription id")
+		},
+		unsubscribeFn: func(context.Context, string) error {
+			unsubscribeCalls.Add(1)
+			return nil
+		},
+	}
+	srv := transportgrpc.NewServer(":0", eng, store, nil)
+
+	const streams = 64
+	start := make(chan struct{})
+	results := make(chan error, streams)
+	var wg sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		vault := "vault-a"
+		if i%2 == 1 {
+			vault = "vault-b"
+		}
+		clientID := "shared-cross-vault-id"
+		if i%4 >= 2 {
+			clientID = " "
+		}
+		wg.Add(1)
+		go func(vault, clientID string) {
+			defer wg.Done()
+			<-start
+			results <- srv.Subscribe(&mockSubscribeStream{
+				ctx: context.Background(),
+				recvReq: &pb.SubscribeRequest{
+					Vault:          vault,
+					SubscriptionID: clientID,
+				},
+			})
+		}(vault, clientID)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("code = %v, want InvalidArgument (err=%v)", status.Code(err), err)
+		}
+	}
+	if got := subscribeCalls.Load(); got != 0 {
+		t.Fatalf("engine subscribe calls = %d, want 0", got)
+	}
+	if got := unsubscribeCalls.Load(); got != 0 {
+		t.Fatalf("engine unsubscribe calls = %d, want 0", got)
+	}
+}
+
+func TestSubscribe_ConcurrentServerAssignedIDsOwnCleanup(t *testing.T) {
+	store := newTestAuthStore(t)
+	for _, vault := range []string{"vault-a", "vault-b"} {
+		if err := store.SetVaultConfig(auth.VaultConfig{Name: vault, Public: true}); err != nil {
+			t.Fatalf("SetVaultConfig(%s): %v", vault, err)
+		}
+	}
+
+	const streams = 64
+	var mu sync.Mutex
+	active := make(map[string]string, streams)
+	assigned := make(map[string]string, streams)
+	cleanupCounts := make(map[string]int, streams)
+	var callbackIssues []string
+	eng := &mockEngine{
+		subscribeWithDeliverFn: func(_ context.Context, req *pb.SubscribeRequest, _ trigger.DeliverFunc) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if req.SubscriptionID == "" {
+				return "", errors.New("server did not assign a subscription id")
+			}
+			if owner, exists := active[req.SubscriptionID]; exists {
+				return "", fmt.Errorf("duplicate subscription id already owned by %s", owner)
+			}
+			active[req.SubscriptionID] = req.Vault
+			assigned[req.SubscriptionID] = req.Vault
+			return req.SubscriptionID, nil
+		},
+		unsubscribeFn: func(ctx context.Context, subID string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if ctx.Err() != nil {
+				callbackIssues = append(callbackIssues, fmt.Sprintf("cleanup %s used canceled context: %v", subID, ctx.Err()))
+			}
+			if _, exists := active[subID]; !exists {
+				callbackIssues = append(callbackIssues, fmt.Sprintf("cleanup did not own %s", subID))
+				return nil
+			}
+			delete(active, subID)
+			cleanupCounts[subID]++
+			return nil
+		},
+	}
+	srv := transportgrpc.NewServer(":0", eng, store, nil)
+
+	start := make(chan struct{})
+	results := make(chan error, streams)
+	var wg sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		vault := "vault-a"
+		if i%2 == 1 {
+			vault = "vault-b"
+		}
+		wg.Add(1)
+		go func(vault string) {
+			defer wg.Done()
+			<-start
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			results <- srv.Subscribe(&cancelOnConfirmSubscribeStream{
+				ctx:    ctx,
+				cancel: cancel,
+				req:    &pb.SubscribeRequest{Vault: vault},
+			})
+		}(vault)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			t.Errorf("Subscribe returned error: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callbackIssues) > 0 {
+		t.Fatalf("ownership issues: %v", callbackIssues)
+	}
+	if len(assigned) != streams {
+		t.Fatalf("unique assigned IDs = %d, want %d", len(assigned), streams)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active subscriptions after teardown = %v, want none", active)
+	}
+	for subID, vault := range assigned {
+		if cleanupCounts[subID] != 1 {
+			t.Errorf("cleanup count for %s (%s) = %d, want 1", subID, vault, cleanupCounts[subID])
+		}
+	}
+}
+
+func TestSubscribe_EngineIDMismatchCleansOnlyAssignedID(t *testing.T) {
+	const otherOwnerID = "other-connection-subscription"
+	var assignedSubID string
+	var cleaned []string
+	var cleanupContextErr error
+	eng := &mockEngine{
+		subscribeWithDeliverFn: func(_ context.Context, req *pb.SubscribeRequest, _ trigger.DeliverFunc) (string, error) {
+			assignedSubID = req.SubscriptionID
+			return otherOwnerID, nil
+		},
+		unsubscribeFn: func(ctx context.Context, subID string) error {
+			cleanupContextErr = ctx.Err()
+			cleaned = append(cleaned, subID)
+			return nil
+		},
+	}
+	srv := newPublicTestServer(t, eng)
+	err := srv.Subscribe(&mockSubscribeStream{
+		ctx:     context.Background(),
+		recvReq: &pb.SubscribeRequest{Vault: "default"},
+	})
+
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal (err=%v)", status.Code(err), err)
+	}
+	if assignedSubID == "" {
+		t.Fatal("server did not assign a subscription ID")
+	}
+	if cleanupContextErr != nil {
+		t.Fatalf("cleanup context error = %v, want nil", cleanupContextErr)
+	}
+	if len(cleaned) != 1 || cleaned[0] != assignedSubID {
+		t.Fatalf("cleaned IDs = %v, want only assigned %q", cleaned, assignedSubID)
+	}
+	if cleaned[0] == otherOwnerID {
+		t.Fatalf("cleanup canceled another owner's subscription %q", otherOwnerID)
+	}
+}
+
 func (m *mockSubscribeStream) Context() context.Context { return m.ctx }
 func (m *mockSubscribeStream) Send(push *pb.ActivationPush) error {
 	if m.sendErr != nil {
@@ -1029,12 +1847,14 @@ func (m *mockSubscribeStream) Recv() (*pb.SubscribeRequest, error) {
 
 func TestSubscribe_Success(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	var assignedSubID string
 
 	eng := &mockEngine{
 		subscribeWithDeliverFn: func(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error) {
-			go func() {
+			assignedSubID = req.SubscriptionID
+			go func(subID string) {
 				push := &trigger.ActivationPush{
-					SubscriptionID: "sub-1",
+					SubscriptionID: subID,
 					Trigger:        trigger.TriggerNewWrite,
 					PushNumber:     1,
 					At:             time.Now(),
@@ -1048,8 +1868,8 @@ func TestSubscribe_Success(t *testing.T) {
 				_ = deliver(ctx, push)
 				time.Sleep(20 * time.Millisecond)
 				cancel()
-			}()
-			return "sub-1", nil
+			}(assignedSubID)
+			return assignedSubID, nil
 		},
 	}
 	srv := newPublicTestServer(t, eng)
@@ -1070,8 +1890,11 @@ func TestSubscribe_Success(t *testing.T) {
 	if stream.sent[0].Trigger != "subscription_created" {
 		t.Errorf("first push trigger = %q, want \"subscription_created\"", stream.sent[0].Trigger)
 	}
-	if stream.sent[0].SubscriptionID != "sub-1" {
-		t.Errorf("SubscriptionID = %q, want \"sub-1\"", stream.sent[0].SubscriptionID)
+	if assignedSubID == "" {
+		t.Fatal("server did not assign a subscription ID")
+	}
+	if stream.sent[0].SubscriptionID != assignedSubID {
+		t.Errorf("SubscriptionID = %q, want %q", stream.sent[0].SubscriptionID, assignedSubID)
 	}
 
 	// The second message should be the actual push with engram data.
@@ -1105,9 +1928,14 @@ func TestSubscribe_RecvError(t *testing.T) {
 }
 
 func TestSubscribe_EngineError(t *testing.T) {
+	var unsubscribeCalls atomic.Int64
 	eng := &mockEngine{
 		subscribeWithDeliverFn: func(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error) {
 			return "", errors.New("subscribe limit reached")
+		},
+		unsubscribeFn: func(context.Context, string) error {
+			unsubscribeCalls.Add(1)
+			return nil
 		},
 	}
 	srv := newPublicTestServer(t, eng)
@@ -1121,12 +1949,15 @@ func TestSubscribe_EngineError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
+	if got := unsubscribeCalls.Load(); got != 0 {
+		t.Fatalf("unsubscribe calls after failed registration = %d, want 0", got)
+	}
 }
 
 func TestSubscribe_SendConfirmError(t *testing.T) {
 	eng := &mockEngine{
 		subscribeWithDeliverFn: func(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error) {
-			return "sub-1", nil
+			return req.SubscriptionID, nil
 		},
 	}
 	srv := newPublicTestServer(t, eng)
@@ -1148,9 +1979,9 @@ func TestSubscribe_NilEngram(t *testing.T) {
 
 	eng := &mockEngine{
 		subscribeWithDeliverFn: func(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error) {
-			go func() {
+			go func(subID string) {
 				push := &trigger.ActivationPush{
-					SubscriptionID: "sub-1",
+					SubscriptionID: subID,
 					Trigger:        trigger.TriggerNewWrite,
 					PushNumber:     1,
 					At:             time.Now(),
@@ -1158,8 +1989,8 @@ func TestSubscribe_NilEngram(t *testing.T) {
 				_ = deliver(ctx, push)
 				time.Sleep(20 * time.Millisecond)
 				cancel()
-			}()
-			return "sub-1", nil
+			}(req.SubscriptionID)
+			return req.SubscriptionID, nil
 		},
 	}
 	srv := newPublicTestServer(t, eng)
@@ -1179,6 +2010,68 @@ func TestSubscribe_NilEngram(t *testing.T) {
 		if msg.Trigger == string(trigger.TriggerNewWrite) && msg.Activation != nil {
 			t.Error("expected nil Activation for push with nil Engram")
 		}
+	}
+}
+
+func TestSubscribe_AuthCancellationReturnsCause(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	authErr := status.Error(codes.Unauthenticated, "api key expired or revoked")
+	cancel(authErr)
+
+	eng := &mockEngine{
+		subscribeWithDeliverFn: func(_ context.Context, req *pb.SubscribeRequest, _ trigger.DeliverFunc) (string, error) {
+			return req.SubscriptionID, nil
+		},
+	}
+	srv := newPublicTestServer(t, eng)
+	stream := &mockSubscribeStream{
+		ctx:     ctx,
+		recvReq: &pb.SubscribeRequest{Vault: "default"},
+	}
+
+	err := srv.Subscribe(stream)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
+	}
+}
+
+func TestSubscribe_AuthCancellationBeforeConfirmationDoesNotSend(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	authErr := status.Error(codes.Unauthenticated, "api key expired or revoked")
+	unsubscribed := false
+	var assignedSubID string
+	eng := &mockEngine{
+		subscribeWithDeliverFn: func(_ context.Context, req *pb.SubscribeRequest, _ trigger.DeliverFunc) (string, error) {
+			assignedSubID = req.SubscriptionID
+			cancel(authErr)
+			return assignedSubID, nil
+		},
+		unsubscribeFn: func(ctx context.Context, subID string) error {
+			if ctx.Err() != nil {
+				t.Errorf("cleanup context is canceled: %v", ctx.Err())
+			}
+			if subID != assignedSubID {
+				t.Errorf("cleanup subscription ID = %q, want owned %q", subID, assignedSubID)
+			}
+			unsubscribed = true
+			return nil
+		},
+	}
+	srv := newPublicTestServer(t, eng)
+	stream := &mockSubscribeStream{
+		ctx:     ctx,
+		recvReq: &pb.SubscribeRequest{Vault: "default"},
+	}
+
+	err := srv.Subscribe(stream)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
+	}
+	if len(stream.sent) != 0 {
+		t.Fatalf("sent %d messages after auth cancellation, want 0", len(stream.sent))
+	}
+	if !unsubscribed {
+		t.Fatal("subscription was not cleaned up after auth cancellation")
 	}
 }
 

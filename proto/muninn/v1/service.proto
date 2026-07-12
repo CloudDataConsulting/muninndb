@@ -186,6 +186,7 @@ message ScoreComponents {
 }
 
 message SubscribeRequest {
+  // Reserved for wire compatibility. Must be empty; the server assigns the ID.
   string subscription_id = 1;
   repeated string context = 2;
   float threshold = 3;

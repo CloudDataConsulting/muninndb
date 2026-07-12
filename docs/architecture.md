@@ -286,7 +286,7 @@ and advertised wire limits.
 
 ### gRPC — Port 8477
 
-Protocol buffers over HTTP/2. Streaming and unary RPCs for all core operations: Write, BatchWrite, Read, Activate, Link, Forget, Stat, Subscribe. API key authentication via "authorization" Bearer token or "x-api-key" metadata header. Supports keepalive, automatic reconnection, and multiplexing over a single HTTP/2 connection. Medium latency; excellent for polyglot systems with gRPC tooling available.
+Protocol buffers over HTTP/2. Streaming and unary RPCs for all core operations: Write, BatchWrite, Read, Activate, Link, Forget, Stat, Subscribe. API key authentication via "authorization" Bearer token or "x-api-key" metadata header. Subscribe IDs are server-assigned: clients must leave `SubscribeRequest.subscription_id` empty and read the assigned ID from the initial `subscription_created` push; a non-empty value is rejected with `InvalidArgument`. Supports keepalive, automatic reconnection, and multiplexing over a single HTTP/2 connection. Medium latency; excellent for polyglot systems with gRPC tooling available.
 
 ### REST — Port 8475
 

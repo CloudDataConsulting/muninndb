@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Public vault unauthenticated access now runs in `full` mode. Previously, requests to an open vault with no API key ran as `observe`, silently preventing cognitive-state writes. Public vaults are now genuinely open; when callers present an API key, its configured mode is still honored.
 - MBP v1 clients must bind non-default vaults during `HELLO`, declare `auth_method: "token"` when sending a token, and accept server-assigned subscription IDs. The legacy `FlagVault` bit no longer represents an authorization override.
+- gRPC `SubscribeRequest.subscription_id` must now be empty. The server assigns the ID and returns it in the initial `subscription_created` push, preventing one connection from replacing or removing another connection's subscription.
 
 ### Fixed
 - Vault-scoped stats no longer disclose database-wide storage usage or vault counts, and omit incremental coherence until it can be reconciled with canonical cardinality.
@@ -19,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-vault counters now reconcile once from canonical records, avoid first-write/delete double counting, and remain correct across batch and merge paths.
 - Prefix scan upper bounds now use the shortest lexicographic successor, preventing carried `0xff` bytes from crossing namespace or vault boundaries.
 - MBP now fails closed at `HELLO`, pins every connection to one authorized vault and key mode, revalidates revocation/expiry/policy on every frame, enforces observe/write-only modes, and prevents cross-connection subscription cancellation.
+- gRPC server-side authorization now pins unary, batch, and streaming requests to their authorized vault, rejects mixed-vault batches, fails closed without an auth store, blocks mutations for observe keys, and blocks reads for write-only keys.
 - Enrich now accepts OpenAI-compatible JSON responses returned in `message.reasoning` when `message.content` is empty, including structured reasoning payloads.
 - Retry and retroactive enrichment now only mark entity and relationship stages complete after successful persistence, avoiding partial-state retries, nil-result crashes, and silent graph-write failures.
 - Entity and relationship response parsing now rejects nested wrapper keys like `meta.entities` / `meta.relationships` instead of treating them as valid empty results.
