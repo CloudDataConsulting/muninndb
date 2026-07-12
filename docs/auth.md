@@ -293,7 +293,7 @@ If each user had their own relevance weights, the vault would have N brains inst
 | Admin passwords | bcrypt with default cost |
 | Session tokens | HMAC-SHA256 signed, 24h TTL, HttpOnly cookie |
 | Transport | HTTP by default; run behind TLS-terminating proxy in production |
-| Key revocation | Immediate, no grace period |
+| Key revocation | Enforced on the next authenticated request or MBP frame, and before each REST SSE delivery. Idle REST SSE streams recheck within 1 second; idle MBP and gRPC streams recheck within 30 seconds by default. Credential expiry can close a stream sooner. |
 | Observe isolation | Enforced at both the REST transport layer (`ReadOnlyGuard`) and the engine activation layer — not just an honor system |
 | Encryption at rest | Not built-in — use OS/volume encryption; see [self-hosting guide](self-hosting.md#encryption-at-rest) |
 
@@ -301,15 +301,26 @@ If each user had their own relevance weights, the vault would have N brains inst
 
 ## Migration from unauthenticated installations
 
-Existing vaults default to `public: true`. Nothing breaks. You add auth incrementally:
+Vault policy is fail-closed. When an installation has no persisted vault
+configuration at all, bootstrap creates only the `default` vault as public. It
+does not automatically make every existing named vault public; any vault without
+an explicit config requires a key. Existing explicit configs are preserved
+unchanged during upgrade.
 
-1. Admin user is created on first run with the new binary
-2. All existing vaults continue to work without keys
-3. Lock specific vaults by setting `public: false` via the admin API
-4. Generate keys for your integrations
-5. Update your integrations to include `Authorization: Bearer mk_...`
+To migrate deliberately:
 
-You can lock vaults one at a time while rolling out keys to your services.
+1. Inventory the existing vault names and their persisted configs.
+2. Explicitly configure every existing vault via the admin API. Set
+   `public: true` only where temporary unauthenticated compatibility is intended;
+   otherwise set `public: false`.
+3. Generate keys for integrations that use locked vaults.
+4. Update those integrations to include `Authorization: Bearer mk_...`.
+5. After verifying key-based access, lock any vaults that were left public only
+   for the migration window.
+
+Until step 2 is complete, existing non-default or otherwise unconfigured vaults
+reject anonymous access. This behavior prevents an upgrade from accidentally
+exposing a previously named vault.
 
 ---
 
