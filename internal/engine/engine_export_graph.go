@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/scrypster/muninndb/internal/storage"
@@ -32,14 +33,17 @@ type ExportGraph struct {
 // If includeEngrams is true the entity type is enriched from the entity record table.
 // Edges are deduplicated by (From, To, RelType): only the highest-weight record per triple is kept.
 func (e *Engine) ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*ExportGraph, error) {
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws, err := e.resolveExistingVaultPrefix(vault)
+	if err != nil {
+		return nil, fmt.Errorf("export graph: resolve persisted workspace: %w", err)
+	}
 
 	// Deduplicate edges by (From, To, RelType): keep highest weight per triple.
 	type edgeKey struct{ From, To, RelType string }
 	edgeBest := make(map[edgeKey]GraphEdge)
 	nodeSet := make(map[string]struct{})
 
-	err := e.store.ScanRelationships(ctx, ws, func(rec storage.RelationshipRecord) error {
+	err = e.store.ScanRelationships(ctx, ws, func(rec storage.RelationshipRecord) error {
 		k := edgeKey{From: rec.FromEntity, To: rec.ToEntity, RelType: rec.RelType}
 		existing, seen := edgeBest[k]
 		if !seen || rec.Weight > existing.Weight {

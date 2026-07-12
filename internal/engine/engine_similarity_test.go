@@ -229,6 +229,14 @@ func TestMergeEntity_EntityANotFound(t *testing.T) {
 	require.Contains(t, err.Error(), "not found")
 }
 
+func TestMergeEntity_VaultNotFound(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	_, err := eng.MergeEntity(context.Background(), "missing-entity-vault", "Legacy", "Canonical", false)
+	require.ErrorIs(t, err, ErrVaultNotFound)
+}
+
 func TestMergeEntity_EntityBNotFound(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()

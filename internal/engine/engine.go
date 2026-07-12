@@ -185,7 +185,7 @@ type Engine struct {
 	stopOnce sync.Once
 
 	// Vault lifecycle fields
-	vaultOpsMu   sync.Mutex     // guards name reservation in StartClone/StartMerge
+	vaultOpsMu   sync.Mutex     // serializes vault name reservation, rename, and delete
 	jobManager   *vaultjob.Manager  // tracks async clone/merge jobs
 	stopCtx      context.Context    // cancelled on Stop() to signal goroutines
 	stopCancel   context.CancelFunc
@@ -374,7 +374,11 @@ func NewEngine(cfg EngineConfig) *Engine {
 	if e.coherence != nil {
 		vaultNames, _ := store.ListVaultNames()
 		for _, name := range vaultNames {
-			prefix := store.ResolveVaultPrefix(name)
+			prefix, err := store.ResolveExistingVaultPrefix(name)
+			if err != nil {
+				slog.Warn("engine: skipped coherence restore for invalid persisted vault mapping", "vault", name, "error", err)
+				continue
+			}
 			data, ok, err := store.ReadCoherence(prefix)
 			if err != nil {
 				slog.Warn("engine: failed to load coherence counters", "vault", name, "error", err)
@@ -442,7 +446,11 @@ func (e *Engine) flushCoherence() {
 		return
 	}
 	for name, data := range e.coherence.SerializeAll() {
-		prefix := e.store.ResolveVaultPrefix(name)
+		prefix, err := e.store.ResolveExistingVaultPrefix(name)
+		if err != nil {
+			slog.Warn("engine: skipped coherence flush for invalid persisted vault mapping", "vault", name, "error", err)
+			continue
+		}
 		if err := e.store.WriteCoherence(prefix, data); err != nil {
 			slog.Warn("engine: failed to flush coherence", "vault", name, "error", err)
 		}
@@ -2620,7 +2628,10 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 	defer mu.Unlock()
 
 	resolved := e.ResolveVaultPlasticity(vaultName)
-	ws := e.store.ResolveVaultPrefix(vaultName)
+	ws, err := e.resolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return 0, fmt.Errorf("prune vault %s: resolve persisted workspace: %w", vaultName, err)
+	}
 
 	var pruned int64
 
@@ -2764,14 +2775,18 @@ func (e *Engine) runPruneWorker() {
 				resolved := e.ResolveVaultPlasticity(vaultName)
 				if resolved.MaxEngrams > 0 || resolved.RetentionDays > 0 {
 					if _, err := e.PruneVault(e.stopCtx, vaultName); err != nil {
-						slog.Debug("vault prune failed", "vault", vaultName, "err", err)
+						slog.Warn("vault prune failed", "vault", vaultName, "err", err)
 					}
 				}
 			}
 			for _, vaultName := range vaults {
 				resolved := e.ResolveVaultPlasticity(vaultName)
 				if resolved.HebbianEnabled && resolved.AssocDecayFactor > 0 {
-					ws := e.store.ResolveVaultPrefix(vaultName)
+					ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+					if err != nil {
+						slog.Warn("assoc decay skipped: invalid persisted vault mapping", "vault", vaultName, "err", err)
+						continue
+					}
 					removed, err := e.store.DecayAssocWeights(e.stopCtx, ws,
 						float64(resolved.AssocDecayFactor), resolved.AssocMinWeight, resolved.ArchiveThreshold)
 					if err != nil {
@@ -2845,7 +2860,11 @@ func (e *Engine) runArchiveGCWorker() {
 		case <-ticker.C:
 			vaults, _ := e.ListVaults(e.stopCtx)
 			for _, vaultName := range vaults {
-				ws := e.store.ResolveVaultPrefix(vaultName)
+				ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+				if err != nil {
+					slog.Warn("engine: archive GC skipped: invalid persisted vault mapping", "vault", vaultName, "err", err)
+					continue
+				}
 				pruned, err := e.store.GCArchivedEdges(e.stopCtx, ws)
 				if err != nil {
 					slog.Warn("engine: archive GC failed", "vault", vaultName, "err", err)
@@ -2964,4 +2983,3 @@ func (e *Engine) RecordFeedback(ctx context.Context, vault, engramID string, use
 	})
 	return nil
 }
-

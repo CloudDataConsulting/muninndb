@@ -469,6 +469,10 @@ func (s *Server) handleEntityGraph(w http.ResponseWriter, r *http.Request) {
 
 	graph, err := s.engine.ExportGraph(r.Context(), vault, includeEngrams)
 	if err != nil {
+		if errors.Is(err, engine.ErrVaultNotFound) {
+			s.sendError(r, w, http.StatusNotFound, ErrVaultNotFound, err.Error())
+			return
+		}
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}

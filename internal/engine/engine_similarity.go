@@ -121,7 +121,10 @@ func (e *Engine) MergeEntity(ctx context.Context, vault, entityA, entityB string
 	e.mergeMu.Lock(entityA, entityB)
 	defer e.mergeMu.Unlock(entityA, entityB)
 
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws, err := e.resolveExistingVaultPrefix(vault)
+	if err != nil {
+		return nil, fmt.Errorf("merge_entity: resolve persisted workspace: %w", err)
+	}
 
 	recA, err := e.store.GetEntityRecord(ctx, entityA)
 	if err != nil {

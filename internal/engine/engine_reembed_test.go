@@ -98,3 +98,53 @@ func TestStartReembedVault_Success(t *testing.T) {
 		}
 	}
 }
+
+// TestStartReembedVault_BlocksRenameAndDelete keeps a real reembed job in its
+// final callback so lifecycle guards can be checked deterministically while the
+// job is still running.
+func TestStartReembedVault_BlocksRenameAndDelete(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const vaultName = "reembed-lifecycle-guard"
+	if _, err := eng.Write(ctx, writeReq(vaultName, "concept", "content")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	eng.SetOnWrite(func() {
+		close(callbackEntered)
+		<-releaseCallback
+	})
+
+	job, err := eng.StartReembedVault(ctx, vaultName, "test-model")
+	if err != nil {
+		close(releaseCallback)
+		t.Fatalf("StartReembedVault: %v", err)
+	}
+
+	select {
+	case <-callbackEntered:
+	case <-time.After(5 * time.Second):
+		close(releaseCallback)
+		t.Fatal("reembed job did not reach blocking callback")
+	}
+
+	if err := eng.RenameVault(ctx, vaultName, vaultName+"-renamed"); !errors.Is(err, ErrVaultJobActive) {
+		close(releaseCallback)
+		t.Fatalf("RenameVault during reembed error = %v, want ErrVaultJobActive", err)
+	}
+	if err := eng.DeleteVault(ctx, vaultName); !errors.Is(err, ErrVaultJobActive) {
+		close(releaseCallback)
+		t.Fatalf("DeleteVault during reembed error = %v, want ErrVaultJobActive", err)
+	}
+
+	close(releaseCallback)
+	finalJob := waitForJob(t, eng, job.ID, 5*time.Second)
+	if finalJob.GetStatus() != vaultjob.StatusDone {
+		t.Fatalf("reembed job status = %s, want %s; err: %s",
+			finalJob.GetStatus(), vaultjob.StatusDone, finalJob.GetErr())
+	}
+}

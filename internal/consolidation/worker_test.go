@@ -2,12 +2,14 @@ package consolidation
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/storage"
+	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
 // TestConsolidation_DryRun verifies that DryRun mode produces no mutations.
@@ -24,6 +26,9 @@ func TestConsolidation_DryRun(t *testing.T) {
 	defer store.Close()
 	vault := "test_vault"
 	wsPrefix := store.ResolveVaultPrefix(vault)
+	if err := store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
 	eng1 := &storage.Engram{
 		Concept:    "concept_1",
@@ -87,6 +92,9 @@ func TestConsolidation_DecayAcceleration_Disabled(t *testing.T) {
 	defer store.Close()
 	vault := "test_vault"
 	wsPrefix := store.ResolveVaultPrefix(vault)
+	if err := store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
 	oldTime := time.Now().Add(-40 * 24 * time.Hour)
 	oldEng := &storage.Engram{
@@ -146,6 +154,9 @@ func TestConsolidation_SchemaPromotion(t *testing.T) {
 	defer store.Close()
 	vault := "test_vault"
 	wsPrefix := store.ResolveVaultPrefix(vault)
+	if err := store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
 	hubEng := &storage.Engram{
 		Concept:    "hub_concept",
@@ -230,6 +241,10 @@ func TestWorker_SchedulerStopsOnContextCancel(t *testing.T) {
 	}
 	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 100})
 	defer store.Close()
+	wsPrefix := store.ResolveVaultPrefix("test_vault")
+	if err := store.WriteVaultName(wsPrefix, "test_vault"); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
 	var listVaultsCalls atomic.Int32
 
@@ -335,6 +350,9 @@ func TestRunOnce_ReportFields(t *testing.T) {
 
 	vault := "report_test"
 	wsPrefix := store.ResolveVaultPrefix(vault)
+	if err := store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
 	e1 := &storage.Engram{
 		Concept: "a", Content: "content a", Confidence: 0.9, Relevance: 0.9,
@@ -370,6 +388,51 @@ func TestRunOnce_ReportFields(t *testing.T) {
 	}
 }
 
+func TestRunOnce_MissingVaultMappingFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := pebble.Open(tmpDir, &pebble.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 100})
+	defer store.Close()
+
+	const vault = "missing-consolidation-vault"
+	worker := NewWorker(&fallbackListEngineInterface{
+		mockEngineInterface: &mockEngineInterface{store: store},
+		vaults:              []string{vault},
+	})
+	if _, err := worker.RunOnce(context.Background(), vault); !errors.Is(err, ErrVaultNotFound) {
+		t.Fatalf("consolidation error = %v, want ErrVaultNotFound", err)
+	}
+}
+
+func TestRunOnce_ListedVaultWithCorruptMappingIsStorageError(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := pebble.Open(tmpDir, &pebble.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 100})
+	defer store.Close()
+
+	const vault = "corrupt-consolidation-vault"
+	wsPrefix := store.ResolveVaultPrefix(vault)
+	if err := store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
+	if err := store.GetDB().Set(keys.VaultNameIndexKey(vault), []byte{0x01}, nil); err != nil {
+		t.Fatalf("corrupt vault name index: %v", err)
+	}
+
+	worker := NewWorker(&mockEngineInterface{store: store})
+	if _, err := worker.RunOnce(context.Background(), vault); err == nil {
+		t.Fatal("consolidation succeeded without a persisted vault mapping")
+	} else if errors.Is(err, ErrVaultNotFound) {
+		t.Fatalf("corrupt listed vault classified as not found: %v", err)
+	}
+}
+
 // TestRunOnce_PhaseErrorsAreNonFatal verifies that an error in one phase
 // is recorded but doesn't prevent subsequent phases from running.
 func TestRunOnce_PhaseErrorsAreNonFatal(t *testing.T) {
@@ -384,8 +447,13 @@ func TestRunOnce_PhaseErrorsAreNonFatal(t *testing.T) {
 
 	mock := &mockEngineInterface{store: store}
 	w := NewWorker(mock)
+	const vault = "empty_vault"
+	wsPrefix := store.ResolveVaultPrefix(vault)
+	if err := store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
-	report, err := w.RunOnce(ctx, "empty_vault")
+	report, err := w.RunOnce(ctx, vault)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,16 +493,21 @@ func TestSafeRunOnce_NormalExecution(t *testing.T) {
 
 	mock := &mockEngineInterface{store: store}
 	w := NewWorker(mock)
+	const vault = "normal_vault"
+	wsPrefix := store.ResolveVaultPrefix(vault)
+	if err := store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
-	report, err := safeRunOnce(w, context.Background(), "normal_vault")
+	report, err := safeRunOnce(w, context.Background(), vault)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if report == nil {
 		t.Fatal("report should not be nil")
 	}
-	if report.Vault != "normal_vault" {
-		t.Errorf("Vault = %q, want %q", report.Vault, "normal_vault")
+	if report.Vault != vault {
+		t.Errorf("Vault = %q, want %q", report.Vault, vault)
 	}
 }
 
@@ -456,6 +529,17 @@ func (p *panicEngineInterface) UpdateLifecycleState(ctx context.Context, vault, 
 // mockEngineInterface implements EngineInterface for testing
 type mockEngineInterface struct {
 	store *storage.PebbleStore
+}
+
+// fallbackListEngineInterface simulates an engine-facing vault list wrapper
+// that synthesizes a fallback name not present in storage.
+type fallbackListEngineInterface struct {
+	*mockEngineInterface
+	vaults []string
+}
+
+func (m *fallbackListEngineInterface) ListVaults(ctx context.Context) ([]string, error) {
+	return m.vaults, nil
 }
 
 func (m *mockEngineInterface) Store() *storage.PebbleStore {

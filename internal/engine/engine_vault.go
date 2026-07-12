@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+
+	"github.com/cockroachdb/pebble"
 )
 
 // ErrVaultNotFound is returned when an operation references a vault that does not exist.
@@ -24,6 +26,70 @@ var ErrEngramSoftDeleted = errors.New("engram is soft-deleted")
 // that already exists. Use errors.Is to check for this error in callers.
 var ErrVaultNameCollision = errors.New("vault name already exists")
 
+// resolveExistingVaultPrefix preserves the public distinction between a vault
+// that is genuinely absent and a persisted lifecycle mapping that is damaged.
+// ResolveExistingVaultPrefix deliberately returns the underlying storage error
+// for both cases; engine callers need ErrVaultNotFound only when neither side
+// of the 0x0E/0x0F mapping survives. Any one-sided or malformed mapping remains
+// a storage failure so destructive callers fail closed instead of treating
+// corruption as an ordinary 404.
+func (e *Engine) resolveExistingVaultPrefix(vaultName string) ([8]byte, error) {
+	ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+	if err == nil {
+		return ws, nil
+	}
+	if !errors.Is(err, pebble.ErrNotFound) {
+		return [8]byte{}, err
+	}
+
+	indexExists, indexErr := e.store.VaultNameIndexExists(vaultName)
+	if indexErr != nil {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: %w (inspect name index evidence: %v)", vaultName, err, indexErr)
+	}
+	if indexExists {
+		return [8]byte{}, err
+	}
+	names, listErr := e.store.ListVaultNames()
+	if listErr != nil {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: %w (list vault names: %v)", vaultName, err, listErr)
+	}
+	for _, name := range names {
+		if name == vaultName {
+			return [8]byte{}, err
+		}
+	}
+	return [8]byte{}, fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
+}
+
+// ensureVaultNameAvailable fails unless neither side of the persisted mapping
+// contains evidence for vaultName and the name-derived workspace is unowned. A
+// valid mapping is an ordinary collision; one-sided/malformed mappings and a
+// workspace retained by a renamed vault are corruption and must not be reused.
+// Rename may pass its resolved source workspace so renaming a vault back to its
+// original derived name remains safe.
+func (e *Engine) ensureVaultNameAvailable(vaultName string, allowedWorkspace *[8]byte) error {
+	_, err := e.resolveExistingVaultPrefix(vaultName)
+	if err == nil {
+		return fmt.Errorf("vault %q: %w", vaultName, ErrVaultNameCollision)
+	}
+	if !errors.Is(err, ErrVaultNotFound) {
+		return fmt.Errorf("vault %q has an invalid persisted lifecycle mapping: %w", vaultName, err)
+	}
+
+	derived := e.store.VaultPrefix(vaultName)
+	owner, occupied, err := e.store.VaultWorkspaceOwner(derived)
+	if err != nil {
+		return fmt.Errorf("vault %q: inspect derived workspace: %w", vaultName, err)
+	}
+	if !occupied {
+		return nil
+	}
+	if allowedWorkspace != nil && derived == *allowedWorkspace {
+		return nil
+	}
+	return fmt.Errorf("vault %q: derived workspace %x is already owned by vault %q", vaultName, derived, owner)
+}
+
 // ClearVault removes all memories from a vault. The vault name remains registered.
 // It evicts all in-memory state (HNSW, FTS IDF cache, novelty fingerprints, coherence
 // counters, activity tracking) and adjusts the global engramCount.
@@ -32,23 +98,10 @@ func (e *Engine) ClearVault(ctx context.Context, vaultName string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Verify the vault exists in the registered name list.
-	names, err := e.store.ListVaultNames()
+	ws, err := e.resolveExistingVaultPrefix(vaultName)
 	if err != nil {
-		return fmt.Errorf("clear vault: list vault names: %w", err)
+		return fmt.Errorf("clear vault: resolve persisted workspace: %w", err)
 	}
-	found := false
-	for _, n := range names {
-		if n == vaultName {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
-	}
-
-	ws := e.store.VaultPrefix(vaultName)
 
 	// NOTE: Jobs already mid-flush may write ghost FTS entries after the range
 	// tombstones land. This is harmless — activation filtering skips engrams
@@ -98,20 +151,24 @@ func (e *Engine) ClearVault(ctx context.Context, vaultName string) error {
 	return nil
 }
 
-// ErrVaultJobActive is returned by DeleteVault when a clone or merge job is
-// currently running against the target vault.
-var ErrVaultJobActive = fmt.Errorf("vault has an active clone/merge job in progress")
+// ErrVaultJobActive is returned when an asynchronous vault job is currently
+// running against a lifecycle name that must remain stable.
+var ErrVaultJobActive = fmt.Errorf("vault has an active job in progress")
 
 // DeleteVault removes all memories and the vault name registration.
-// Returns ErrVaultJobActive if any clone/merge job is currently running against this vault.
+// Returns ErrVaultJobActive if any asynchronous job is currently writing to this vault.
 // It calls ClearVault (which adjusts engramCount and in-memory state),
 // then deletes the vault name keys from storage.
 //
-// Note: ws must be captured BEFORE calling ClearVault, because ClearVault
-// evicts vaultPrefixCache for the vault name. After ClearVault,
-// store.VaultPrefix would still return the SipHash but the name is no longer
-// registered — DeleteVaultNameOnly needs the ws captured before eviction.
+// Note: ws must be resolved BEFORE calling ClearVault because renamed vaults
+// retain their original workspace.
 func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
+	// Serialize the full delete lifecycle with rename and name-reserving
+	// clone/merge/import setup. Without this lock, rename can move 0x0E/0x0F
+	// after clear but before name cleanup, leaving a dangling name index.
+	e.vaultOpsMu.Lock()
+	defer e.vaultOpsMu.Unlock()
+
 	// Reject deletion if a clone/merge job is actively writing into this vault
 	// (i.e., the vault is the Target of a running job). Deleting a vault that is
 	// a Source is allowed — the merge's own post-copy cleanup calls DeleteVault
@@ -121,7 +178,10 @@ func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 	}
 
 	// Capture ws BEFORE ClearVault evicts the in-memory name cache.
-	ws := e.store.VaultPrefix(vaultName)
+	ws, err := e.resolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return fmt.Errorf("delete vault: resolve persisted workspace: %w", err)
+	}
 
 	if err := e.ClearVault(ctx, vaultName); err != nil {
 		return fmt.Errorf("delete vault (clear phase): %w", err)
@@ -155,39 +215,25 @@ func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 
 // RenameVault atomically renames a vault. This is a metadata-only operation —
 // no engram data is moved or modified. Returns ErrVaultNotFound if oldName
-// doesn't exist, ErrVaultJobActive if a clone/merge job targets the vault,
+// doesn't exist, ErrVaultJobActive if an asynchronous job involves the vault,
 // or an error if newName already exists.
 func (e *Engine) RenameVault(ctx context.Context, oldName, newName string) error {
 	e.vaultOpsMu.Lock()
 	defer e.vaultOpsMu.Unlock()
 
-	// Validate oldName exists and newName doesn't.
-	names, err := e.store.ListVaultNames()
+	ws, err := e.resolveExistingVaultPrefix(oldName)
 	if err != nil {
-		return fmt.Errorf("rename vault: list names: %w", err)
+		return fmt.Errorf("rename vault: resolve source workspace: %w", err)
 	}
-	var oldFound, newFound bool
-	for _, n := range names {
-		if n == oldName {
-			oldFound = true
-		}
-		if n == newName {
-			newFound = true
-		}
-	}
-	if !oldFound {
-		return fmt.Errorf("vault %q: %w", oldName, ErrVaultNotFound)
-	}
-	if newFound {
-		return fmt.Errorf("vault %q: %w", newName, ErrVaultNameCollision)
+	if err := e.ensureVaultNameAvailable(newName, &ws); err != nil {
+		return fmt.Errorf("rename vault: target name unavailable: %w", err)
 	}
 
-	// Reject if a clone/merge job is targeting this vault.
-	if e.jobManager != nil && e.jobManager.HasActiveJobTargeting(oldName) {
+	// Jobs retain source and target names captured at creation. Renaming either
+	// side mid-job can make post-merge cleanup target the wrong lifecycle.
+	if e.jobManager != nil && e.jobManager.HasActiveJobInvolving(oldName) {
 		return fmt.Errorf("rename vault %q: %w", oldName, ErrVaultJobActive)
 	}
-
-	ws := e.store.ResolveVaultPrefix(oldName)
 
 	// Storage: atomic batch rename.
 	if err := e.store.RenameVault(ws, oldName, newName); err != nil {

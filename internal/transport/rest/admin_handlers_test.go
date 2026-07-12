@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/config"
+	"github.com/scrypster/muninndb/internal/engine"
 	"github.com/scrypster/muninndb/internal/plugin"
 	"github.com/scrypster/muninndb/internal/replication"
 )
@@ -768,6 +770,24 @@ func TestEntityGraph_InvalidVault(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for invalid vault, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+type entityGraphNotFoundEngine struct{ MockEngine }
+
+func (e *entityGraphNotFoundEngine) ExportGraph(_ context.Context, vault string, _ bool) (*engine.ExportGraph, error) {
+	return nil, fmt.Errorf("export graph %q: %w", vault, engine.ErrVaultNotFound)
+}
+
+func TestEntityGraph_MissingVaultReturnsNotFound(t *testing.T) {
+	srv := NewServer("localhost:0", &entityGraphNotFoundEngine{}, newTestAuthStore(t), nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+	req := httptest.NewRequest("GET", "/api/admin/entity-graph?vault=missing-vault", nil)
+	w := httptest.NewRecorder()
+
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing entity-graph vault, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

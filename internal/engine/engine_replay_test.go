@@ -184,8 +184,13 @@ func TestReplayEnrichment_NoPipelineReturnsError(t *testing.T) {
 func TestReplayEnrichment_DryRunEmptyVault(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()
+	const vault = "empty-vault"
+	ws := eng.store.VaultPrefix(vault)
+	if err := eng.store.WriteVaultName(ws, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
-	result, err := eng.ReplayEnrichment(context.Background(), "empty-vault", nil, 50, true)
+	result, err := eng.ReplayEnrichment(context.Background(), vault, nil, 50, true)
 	if err != nil {
 		t.Fatalf("ReplayEnrichment on empty vault: %v", err)
 	}
@@ -213,9 +218,14 @@ func TestReplayEnrichment_InvalidStageName(t *testing.T) {
 func TestReplayEnrichment_StagesRunReflectsRequest(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()
+	const vault = "default"
+	ws := eng.store.VaultPrefix(vault)
+	if err := eng.store.WriteVaultName(ws, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
 	requested := []string{"summary", "classification"}
-	result, err := eng.ReplayEnrichment(context.Background(), "default", requested, 50, true)
+	result, err := eng.ReplayEnrichment(context.Background(), vault, requested, 50, true)
 	if err != nil {
 		t.Fatalf("ReplayEnrichment: %v", err)
 	}
@@ -227,6 +237,15 @@ func TestReplayEnrichment_StagesRunReflectsRequest(t *testing.T) {
 		if result.StagesRun[i] != stage {
 			t.Errorf("StagesRun[%d] = %q, want %q", i, result.StagesRun[i], stage)
 		}
+	}
+}
+
+func TestReplayEnrichment_MissingVaultFailsClosed(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	if _, err := eng.ReplayEnrichment(context.Background(), "missing-replay-vault", nil, 50, true); !errors.Is(err, ErrVaultNotFound) {
+		t.Fatalf("ReplayEnrichment error = %v, want ErrVaultNotFound", err)
 	}
 }
 

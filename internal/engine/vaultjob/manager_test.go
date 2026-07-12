@@ -152,6 +152,30 @@ func TestJobManager_RunningCountDecrement(t *testing.T) {
 	}
 }
 
+func TestJobManager_HasActiveJobInvolvingChecksSourceAndTarget(t *testing.T) {
+	m := NewManager()
+	defer m.Close()
+	job, err := m.Create("merge", "source-vault", "target-vault")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !m.HasActiveJobInvolving("source-vault") {
+		t.Fatal("running job source was not reported as involved")
+	}
+	if !m.HasActiveJobInvolving("target-vault") {
+		t.Fatal("running job target was not reported as involved")
+	}
+	if m.HasActiveJobInvolving("unrelated-vault") {
+		t.Fatal("unrelated vault was reported as involved")
+	}
+
+	m.Complete(job)
+	if m.HasActiveJobInvolving("source-vault") || m.HasActiveJobInvolving("target-vault") {
+		t.Fatal("completed job still blocks vault rename")
+	}
+}
+
 func TestJobManager_Close_Idempotent(t *testing.T) {
 	m := NewManager()
 	// First Close must not panic.

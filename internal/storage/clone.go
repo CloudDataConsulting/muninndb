@@ -62,9 +62,9 @@ const cloneBatchSize = 512
 //   - VaultCountKey[wsTarget] is written with the number of engrams copied.
 //   - CoherenceKey[wsTarget] is written with zeroed [7]int64 counters.
 //
-// NOTE: WriteVaultName must be called by the caller (under vaultOpsMu) before
-// launching the goroutine that calls CloneVaultData. The name cache entry is
-// cleared here so the caller's prior WriteVaultName persists correctly.
+// NOTE: the caller must persistently reserve the target name (under
+// vaultOpsMu) before launching the goroutine that calls CloneVaultData. The
+// name cache entry is cleared here so that reservation persists correctly.
 //
 // onCopy is called after every batch commit with the running engram total.
 // Returns the number of engrams copied.
@@ -238,8 +238,8 @@ func (ps *PebbleStore) CloneVaultData(
 	}
 
 	// ---- Phase 3: VaultCountKey for target ----
-	// (WriteVaultName was already called by the engine under vaultOpsMu before
-	// this goroutine was launched; the cache entry was written there.)
+	// (The target name was already reserved by the engine under vaultOpsMu
+	// before this goroutine was launched; the cache entry was written there.)
 
 	// ---- Phase 4: Write computed VaultCountKey for target ----
 	// Encode as BigEndian int64 (matches getOrInitCounter read path in impl.go).

@@ -3,7 +3,9 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -53,6 +55,9 @@ func TestEngineExportVaultNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing vault")
 	}
+	if !errors.Is(err, ErrVaultNotFound) {
+		t.Fatalf("ExportVault error = %v, want ErrVaultNotFound", err)
+	}
 }
 
 func TestEngineStartImport(t *testing.T) {
@@ -86,6 +91,29 @@ func TestEngineStartImport(t *testing.T) {
 	}
 	if job.ID == "" {
 		t.Error("expected non-empty job ID")
+	}
+}
+
+func TestEngineDeleteVaultRejectsActiveImport(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	job, err := eng.StartImport(context.Background(), "blocked-import-target", "", 0, false, reader)
+	if err != nil {
+		t.Fatalf("StartImport: %v", err)
+	}
+
+	err = eng.DeleteVault(context.Background(), "blocked-import-target")
+	if !errors.Is(err, ErrVaultJobActive) {
+		t.Fatalf("DeleteVault during active import = %v, want ErrVaultJobActive", err)
+	}
+
+	_ = writer.CloseWithError(errors.New("end blocked import"))
+	finalJob := waitForJob(t, eng, job.ID, 5*time.Second)
+	if finalJob.GetStatus() != vaultjob.StatusError {
+		t.Fatalf("blocked import job status = %s, want %s", finalJob.GetStatus(), vaultjob.StatusError)
 	}
 }
 

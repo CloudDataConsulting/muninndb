@@ -2,12 +2,19 @@ package consolidation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/storage"
 )
+
+// ErrVaultNotFound identifies a consolidation request for a vault with no
+// persisted lifecycle mapping. Corrupt or one-sided mappings are not treated
+// as not-found so callers can surface them as storage failures.
+var ErrVaultNotFound = errors.New("consolidation vault not found")
 
 // EngineInterface is the minimal engine surface needed by the consolidation worker.
 // It avoids circular imports while providing all necessary operations.
@@ -51,7 +58,39 @@ func (w *Worker) RunOnce(ctx context.Context, vault string) (*ConsolidationRepor
 	}
 
 	store := w.Engine.Store()
-	wsPrefix := store.ResolveVaultPrefix(vault)
+	wsPrefix, err := store.ResolveExistingVaultPrefix(vault)
+	if err != nil {
+		if !errors.Is(err, pebble.ErrNotFound) {
+			return nil, fmt.Errorf("consolidation: resolve persisted workspace: %w", err)
+		}
+		// A surviving name index or metadata record means the lifecycle mapping
+		// is corrupt, not absent. Preserve that distinction so REST callers only
+		// return 404 for a genuinely unknown vault.
+		indexExists, indexErr := store.VaultNameIndexExists(vault)
+		if indexErr != nil {
+			return nil, fmt.Errorf("consolidation: resolve persisted workspace: %w (inspect name index evidence: %v)", err, indexErr)
+		}
+		if !indexExists {
+			// Consult storage directly. Engine-facing ListVaults wrappers may
+			// synthesize a default vault when storage is empty or unavailable,
+			// which must not change absence-versus-corruption classification.
+			vaults, listErr := store.ListVaultNames()
+			if listErr != nil {
+				return nil, fmt.Errorf("consolidation: resolve persisted workspace: %w (list vaults: %v)", err, listErr)
+			}
+			listed := false
+			for _, name := range vaults {
+				if name == vault {
+					listed = true
+					break
+				}
+			}
+			if !listed {
+				return nil, fmt.Errorf("consolidation: vault %q: %w", vault, ErrVaultNotFound)
+			}
+		}
+		return nil, fmt.Errorf("consolidation: resolve persisted workspace: %w", err)
+	}
 
 	// Phase 1: Activation Replay
 	if err := w.runPhase1Replay(ctx, store, wsPrefix, report); err != nil {
@@ -121,8 +160,11 @@ func (w *Worker) Start(ctx context.Context) {
 			for _, vault := range vaults {
 				// Run with a timeout to prevent hanging
 				runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-				_, _ = safeRunOnce(w, runCtx, vault)
+				_, runErr := safeRunOnce(w, runCtx, vault)
 				cancel()
+				if runErr != nil && ctx.Err() == nil {
+					slog.Warn("consolidation: scheduled run failed", "vault", vault, "error", runErr)
+				}
 			}
 		}
 	}

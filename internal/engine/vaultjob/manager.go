@@ -220,7 +220,7 @@ func (m *Manager) Fail(j *Job, err error) {
 
 // HasActiveJobTargeting returns true if any currently-running job lists vaultName
 // as its Target. Used to guard vault deletion: a vault being written to by an
-// active clone/merge must not be deleted mid-operation.
+// active asynchronous job must not be deleted mid-operation.
 // Deleting a source vault is not blocked here — the merge's own cleanup path
 // calls DeleteVault on the source after the copy phase, which must be allowed.
 func (m *Manager) HasActiveJobTargeting(vaultName string) bool {
@@ -230,6 +230,23 @@ func (m *Manager) HasActiveJobTargeting(vaultName string) bool {
 		if j.GetStatus() == StatusRunning && j.Target == vaultName {
 			found = true
 			return false // stop iteration
+		}
+		return true
+	})
+	return found
+}
+
+// HasActiveJobInvolving returns true if a currently-running job uses vaultName
+// as either its source or target. Rename uses this stricter guard because jobs
+// retain the names captured at creation time; changing either name mid-job can
+// make cleanup or status reporting target the wrong lifecycle.
+func (m *Manager) HasActiveJobInvolving(vaultName string) bool {
+	found := false
+	m.jobs.Range(func(_, v any) bool {
+		j := v.(*Job)
+		if j.GetStatus() == StatusRunning && (j.Source == vaultName || j.Target == vaultName) {
+			found = true
+			return false
 		}
 		return true
 	})
@@ -270,4 +287,3 @@ func (m *Manager) gc() {
 		}
 	}
 }
-

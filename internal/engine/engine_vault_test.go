@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -143,6 +144,9 @@ func TestEngineClearVault_NotFound(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for unknown vault, got nil")
 	}
+	if !errors.Is(err, ErrVaultNotFound) {
+		t.Errorf("ClearVault error = %v, want ErrVaultNotFound", err)
+	}
 }
 
 func TestEngineDeleteVault_NotFound(t *testing.T) {
@@ -153,6 +157,18 @@ func TestEngineDeleteVault_NotFound(t *testing.T) {
 	err := eng.DeleteVault(ctx, "does-not-exist")
 	if err == nil {
 		t.Error("expected error for unknown vault, got nil")
+	}
+	if !errors.Is(err, ErrVaultNotFound) {
+		t.Errorf("DeleteVault error = %v, want ErrVaultNotFound", err)
+	}
+}
+
+func TestEnginePruneVault_NotFound(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	if _, err := eng.PruneVault(context.Background(), "does-not-exist"); !errors.Is(err, ErrVaultNotFound) {
+		t.Errorf("PruneVault error = %v, want ErrVaultNotFound", err)
 	}
 }
 
@@ -254,6 +270,9 @@ func TestEngineRenameVault_NotFound(t *testing.T) {
 	err := eng.RenameVault(ctx, "no-such-vault", "anything")
 	if err == nil {
 		t.Fatal("expected error for nonexistent vault, got nil")
+	}
+	if !errors.Is(err, ErrVaultNotFound) {
+		t.Errorf("RenameVault error = %v, want ErrVaultNotFound", err)
 	}
 }
 
@@ -606,7 +625,7 @@ func TestDeleteVault_VaultMuEntryRemoved(t *testing.T) {
 }
 
 // TestEngineRenameVault_JobActive verifies that renaming a vault with an
-// active clone/merge job targeting it returns ErrVaultJobActive.
+// active asynchronous job targeting it returns ErrVaultJobActive.
 func TestEngineRenameVault_JobActive(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()
@@ -630,10 +649,34 @@ func TestEngineRenameVault_JobActive(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected ErrVaultJobActive, got nil")
 	}
-	if !strings.Contains(err.Error(), "active clone/merge job") {
+	if !errors.Is(err, ErrVaultJobActive) {
 		t.Errorf("expected ErrVaultJobActive in error, got: %v", err)
 	}
 
 	// Clean up: complete the job so the engine can shut down cleanly.
 	eng.jobManager.Complete(job)
+}
+
+func TestEngineRenameVault_ActiveJobSourceIsBlocked(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const source = "job-active-source-vault"
+	if _, err := eng.Write(ctx, writeReq(source, "concept", "content")); err != nil {
+		t.Fatal(err)
+	}
+	job, err := eng.jobManager.Create("merge", source, "some-target")
+	if err != nil {
+		t.Fatalf("jobManager.Create: %v", err)
+	}
+	defer eng.jobManager.Complete(job)
+
+	err = eng.RenameVault(ctx, source, "renamed-source")
+	if err == nil {
+		t.Fatal("expected ErrVaultJobActive for running job source, got nil")
+	}
+	if !errors.Is(err, ErrVaultJobActive) {
+		t.Fatalf("rename error = %v, want ErrVaultJobActive", err)
+	}
 }

@@ -15,22 +15,10 @@ import (
 // Returns an ExportResult with engram count and total key count.
 // Returns ErrVaultNotFound if the vault does not exist.
 func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel string, dimension int, resetMeta bool, w io.Writer) (*storage.ExportResult, error) {
-	names, err := e.store.ListVaultNames()
+	ws, err := e.resolveExistingVaultPrefix(vaultName)
 	if err != nil {
-		return nil, fmt.Errorf("export vault: list vaults: %w", err)
+		return nil, fmt.Errorf("export vault %q: resolve persisted workspace: %w", vaultName, err)
 	}
-	found := false
-	for _, n := range names {
-		if n == vaultName {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return nil, fmt.Errorf("export vault %q: %w", vaultName, ErrVaultNotFound)
-	}
-
-	ws := e.store.VaultPrefix(vaultName)
 	opts := storage.ExportOpts{
 		EmbedderModel: embedderModel,
 		Dimension:     dimension,
@@ -49,27 +37,17 @@ func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel strin
 // Returns an error if vaultName already exists.
 func (e *Engine) StartImport(ctx context.Context, vaultName, embedderModel string, dimension int, resetMeta bool, r io.Reader) (*vaultjob.Job, error) {
 	e.vaultOpsMu.Lock()
+	defer e.vaultOpsMu.Unlock()
 
-	names, err := e.store.ListVaultNames()
-	if err != nil {
-		e.vaultOpsMu.Unlock()
-		return nil, fmt.Errorf("start import: list vaults: %w", err)
-	}
-	for _, n := range names {
-		if n == vaultName {
-			e.vaultOpsMu.Unlock()
-			return nil, fmt.Errorf("start import: vault %q: %w", vaultName, ErrVaultNameCollision)
-		}
+	if err := e.ensureVaultNameAvailable(vaultName, nil); err != nil {
+		return nil, fmt.Errorf("start import: target name unavailable: %w", err)
 	}
 
 	// Reserve the vault name before releasing the lock.
 	wsTarget := e.store.VaultPrefix(vaultName)
-	if err := e.store.WriteVaultName(wsTarget, vaultName); err != nil {
-		e.vaultOpsMu.Unlock()
+	if err := e.store.ReserveVaultName(wsTarget, vaultName); err != nil {
 		return nil, fmt.Errorf("start import: reserve vault name: %w", err)
 	}
-
-	e.vaultOpsMu.Unlock()
 
 	job, err := e.jobManager.Create("import", "", vaultName)
 	if err != nil {

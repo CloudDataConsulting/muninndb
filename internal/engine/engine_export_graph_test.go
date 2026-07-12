@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -135,7 +136,11 @@ func TestExportGraph_DeduplicatesEdgesByTriple(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	ws := eng.store.ResolveVaultPrefix("dedup-vault")
+	const vault = "dedup-vault"
+	ws := eng.store.VaultPrefix(vault)
+	if err := eng.store.WriteVaultName(ws, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 	var id1, id2 storage.ULID
 	id1[0] = 1
 	id2[0] = 2
@@ -147,7 +152,7 @@ func TestExportGraph_DeduplicatesEdgesByTriple(t *testing.T) {
 		FromEntity: "A", ToEntity: "B", RelType: "co_occurs_with", Weight: 0.4, Source: "co-occurrence",
 	})
 
-	g, err := eng.ExportGraph(ctx, "dedup-vault", false)
+	g, err := eng.ExportGraph(ctx, vault, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,8 +199,13 @@ func TestExportGraph_CoOccursWithAutoPopulated(t *testing.T) {
 func TestExportGraph_EmptyVault(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()
+	const vault = "empty-vault"
+	ws := eng.store.VaultPrefix(vault)
+	if err := eng.store.WriteVaultName(ws, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
-	g, err := eng.ExportGraph(context.Background(), "empty-vault", false)
+	g, err := eng.ExportGraph(context.Background(), vault, false)
 	require.NoError(t, err)
 	require.NotNil(t, g)
 	require.Empty(t, g.Nodes, "expected no nodes for empty vault")
@@ -223,6 +233,10 @@ func TestExportGraph_DeterministicOrder(t *testing.T) {
 
 	ctx := context.Background()
 	vault := "deterministic-test"
+	ws := eng.store.VaultPrefix(vault)
+	if err := eng.store.WriteVaultName(ws, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
 
 	// Write several engrams with different entities to create a diverse graph.
 	entities := []struct {
@@ -239,7 +253,6 @@ func TestExportGraph_DeterministicOrder(t *testing.T) {
 	}
 
 	for _, e := range entities {
-		ws := eng.store.ResolveVaultPrefix(vault)
 		id := storage.ULID{}
 		// Write some relationship records to populate the graph.
 		_ = eng.store.UpsertRelationshipRecord(ctx, ws, id, storage.RelationshipRecord{
@@ -299,5 +312,14 @@ func TestExportGraph_DeterministicOrder(t *testing.T) {
 		} else {
 			require.Less(t, prev.From, curr.From, "edges not sorted by From at index %d", i)
 		}
+	}
+}
+
+func TestExportGraph_MissingVaultFailsClosed(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	if _, err := eng.ExportGraph(context.Background(), "missing-graph-vault", false); !errors.Is(err, ErrVaultNotFound) {
+		t.Fatalf("ExportGraph error = %v, want ErrVaultNotFound", err)
 	}
 }

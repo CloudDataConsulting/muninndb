@@ -16,35 +16,22 @@ import (
 func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*vaultjob.Job, error) {
 	// I3: Hold vaultOpsMu for the entire check+reserve window so that a
 	// concurrent clone/delete cannot race between the existence check and the
-	// WriteVaultName reservation.
+	// persisted name reservation.
 	e.vaultOpsMu.Lock()
 	defer e.vaultOpsMu.Unlock()
 
-	names, err := e.store.ListVaultNames()
+	wsSource, err := e.resolveExistingVaultPrefix(sourceVault)
 	if err != nil {
-		return nil, fmt.Errorf("start clone: list vaults: %w", err)
+		return nil, fmt.Errorf("start clone: resolve source workspace: %w", err)
 	}
-	sourceFound := false
-	targetExists := false
-	for _, n := range names {
-		if n == sourceVault {
-			sourceFound = true
-		}
-		if n == newName {
-			targetExists = true
-		}
-	}
-	if !sourceFound {
-		return nil, fmt.Errorf("start clone: source vault %q: %w", sourceVault, ErrVaultNotFound)
-	}
-	if targetExists {
-		return nil, fmt.Errorf("start clone: target vault %q: %w", newName, ErrVaultNameCollision)
+	if err := e.ensureVaultNameAvailable(newName, nil); err != nil {
+		return nil, fmt.Errorf("start clone: target name unavailable: %w", err)
 	}
 
 	// Reserve the target vault name before releasing the mutex.
-	// CloneVaultData no longer calls WriteVaultName; we do it here atomically.
+	// CloneVaultData no longer writes lifecycle metadata; reserve it here first.
 	wsTarget := e.store.VaultPrefix(newName)
-	if err := e.store.WriteVaultName(wsTarget, newName); err != nil {
+	if err := e.store.ReserveVaultName(wsTarget, newName); err != nil {
 		return nil, fmt.Errorf("start clone: reserve vault name: %w", err)
 	}
 
@@ -57,8 +44,6 @@ func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*
 		}
 		return nil, fmt.Errorf("start clone: %w", err)
 	}
-
-	wsSource := e.store.VaultPrefix(sourceVault)
 
 	// Count engrams in source to set CopyTotal/IndexTotal for progress tracking.
 	sourceCount := e.store.GetVaultCount(ctx, wsSource)
@@ -96,7 +81,7 @@ func (e *Engine) runClone(job *vaultjob.Job, wsSource, wsTarget [8]byte, newName
 	}()
 
 	// Phase 1: Copy data via storage layer.
-	// Note: WriteVaultName was already called under vaultOpsMu in StartClone.
+	// Note: the target name was already reserved under vaultOpsMu in StartClone.
 	// I8: SetClearing(wsTarget) removed — reindexVault writes are idempotent
 	// last-write-wins KV ops; duplicate FTS posting list entries are harmless.
 	copied, err := e.store.CloneVaultData(ctx, wsSource, wsTarget, func(n int64) {
@@ -166,34 +151,19 @@ func (e *Engine) StartMerge(ctx context.Context, sourceVault, targetVault string
 	e.vaultOpsMu.Lock()
 	defer e.vaultOpsMu.Unlock()
 
-	names, err := e.store.ListVaultNames()
+	wsSource, err := e.resolveExistingVaultPrefix(sourceVault)
 	if err != nil {
-		return nil, fmt.Errorf("start merge: list vaults: %w", err)
+		return nil, fmt.Errorf("start merge: resolve source workspace: %w", err)
 	}
-	sourceFound := false
-	targetFound := false
-	for _, n := range names {
-		if n == sourceVault {
-			sourceFound = true
-		}
-		if n == targetVault {
-			targetFound = true
-		}
-	}
-	if !sourceFound {
-		return nil, fmt.Errorf("start merge: source vault %q: %w", sourceVault, ErrVaultNotFound)
-	}
-	if !targetFound {
-		return nil, fmt.Errorf("start merge: target vault %q: %w", targetVault, ErrVaultNotFound)
+	wsTarget, err := e.resolveExistingVaultPrefix(targetVault)
+	if err != nil {
+		return nil, fmt.Errorf("start merge: resolve target workspace: %w", err)
 	}
 
 	job, err := e.jobManager.Create("merge", sourceVault, targetVault)
 	if err != nil {
 		return nil, fmt.Errorf("start merge: %w", err)
 	}
-
-	wsSource := e.store.VaultPrefix(sourceVault)
-	wsTarget := e.store.VaultPrefix(targetVault)
 
 	sourceCount := e.store.GetVaultCount(ctx, wsSource)
 	job.CopyTotal = sourceCount
@@ -253,8 +223,8 @@ func (e *Engine) runMerge(job *vaultjob.Job, wsSource, wsTarget [8]byte, sourceV
 	// Optionally delete the source vault after merge.
 	if deleteSource {
 		if err := e.DeleteVault(ctx, sourceVault); err != nil {
-			slog.Warn("post-merge source vault deletion failed; source vault still exists",
-				"vault", sourceVault, "err", err)
+			e.jobManager.Fail(job, fmt.Errorf("post-merge source vault deletion: %w", err))
+			return
 		}
 	}
 

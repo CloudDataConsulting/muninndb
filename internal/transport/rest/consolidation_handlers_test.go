@@ -2,6 +2,7 @@ package rest
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/scrypster/muninndb/internal/storage"
+	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
 // consolidationMockEngine implements both EngineAPI (via embedding MockEngine) and
@@ -76,6 +78,10 @@ func newConsolidationTestEngine(t *testing.T) *consolidationMockEngine {
 // TestHandleConsolidate_Success posts a valid consolidation request and expects HTTP 200.
 func TestHandleConsolidate_Success(t *testing.T) {
 	eng := newConsolidationTestEngine(t)
+	wsPrefix := eng.store.ResolveVaultPrefix("default")
+	if err := eng.store.WriteVaultName(wsPrefix, "default"); err != nil {
+		t.Fatalf("register default vault: %v", err)
+	}
 	srv := NewServer("localhost:0", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
 	handler := srv.handleConsolidate()
@@ -111,8 +117,7 @@ func TestHandleConsolidate_MissingVault(t *testing.T) {
 	}
 }
 
-// TestHandleConsolidate_UnknownVault verifies the handler returns 200 for an unknown vault
-// (the consolidation worker performs a best-effort run on any vault name).
+// TestHandleConsolidate_UnknownVault verifies an unknown vault fails closed with 404.
 func TestHandleConsolidate_UnknownVault(t *testing.T) {
 	eng := newConsolidationTestEngine(t)
 	srv := NewServer("localhost:0", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
@@ -126,10 +131,49 @@ func TestHandleConsolidate_UnknownVault(t *testing.T) {
 
 	handler(w, req)
 
-	// The consolidation worker does not error on unknown vaults; it runs a
-	// best-effort empty pass and returns a zero-count report with HTTP 200.
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 for unknown vault (worker is best-effort), got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown vault, got %d: %s", w.Code, w.Body.String())
+	}
+	var response ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != ErrVaultNotFound {
+		t.Errorf("error code = %v, want %v", response.Error.Code, ErrVaultNotFound)
+	}
+}
+
+// TestHandleConsolidate_CorruptListedVault verifies a one-sided/corrupt
+// persisted mapping is a storage failure, not a not-found response.
+func TestHandleConsolidate_CorruptListedVault(t *testing.T) {
+	eng := newConsolidationTestEngine(t)
+	const vault = "corrupt-vault"
+	wsPrefix := eng.store.ResolveVaultPrefix(vault)
+	if err := eng.store.WriteVaultName(wsPrefix, vault); err != nil {
+		t.Fatalf("register vault: %v", err)
+	}
+	if err := eng.store.GetDB().Set(keys.VaultNameIndexKey(vault), []byte{0x01}, nil); err != nil {
+		t.Fatalf("corrupt vault name index: %v", err)
+	}
+	srv := NewServer("localhost:0", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	handler := srv.handleConsolidate()
+	req := httptest.NewRequest("POST", "/v1/vaults/"+vault+"/consolidate", strings.NewReader(`{}`))
+	req.SetPathValue("vault", vault)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for corrupt listed vault, got %d: %s", w.Code, w.Body.String())
+	}
+	var response ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != ErrStorageError {
+		t.Errorf("error code = %v, want %v", response.Error.Code, ErrStorageError)
 	}
 }
 

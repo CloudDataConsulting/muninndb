@@ -525,7 +525,11 @@ func runStartupMigrations(ctx context.Context, store *storage.PebbleStore) {
 		return
 	}
 	for _, name := range names {
-		prefix := store.ResolveVaultPrefix(name)
+		prefix, err := store.ResolveExistingVaultPrefix(name)
+		if err != nil {
+			slog.Warn("startup migration: skipped invalid persisted vault mapping", "vault", name, "err", err)
+			continue
+		}
 		if err := store.MigrateBuckets(ctx, prefix); err != nil {
 			slog.Warn("startup migration: MigrateBuckets failed", "vault", name, "err", err)
 		}

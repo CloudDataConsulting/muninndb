@@ -23,29 +23,23 @@ import (
 // goroutine (typically seconds). Actual re-embedding is handled by the existing
 // RetroactiveProcessor micro-batch pipeline.
 func (e *Engine) StartReembedVault(ctx context.Context, vaultName, modelName string) (*vaultjob.Job, error) {
+	// Keep persisted-name resolution and job registration atomic with rename
+	// and delete. Once the job is registered, their active-job guards prevent
+	// either lifecycle operation from invalidating the name captured by the job.
+	// Lock order must remain vaultOpsMu -> per-vault mutex to match DeleteVault.
+	e.vaultOpsMu.Lock()
+	defer e.vaultOpsMu.Unlock()
+
 	mu := e.getVaultMutex(vaultName)
 	if !mu.TryLock() {
 		return nil, fmt.Errorf("vault %q: another operation is in progress", vaultName)
 	}
 	defer mu.Unlock()
 
-	// Verify vault exists.
-	names, err := e.store.ListVaultNames()
+	ws, err := e.resolveExistingVaultPrefix(vaultName)
 	if err != nil {
-		return nil, fmt.Errorf("reembed: list vault names: %w", err)
+		return nil, fmt.Errorf("reembed: resolve persisted workspace: %w", err)
 	}
-	found := false
-	for _, n := range names {
-		if n == vaultName {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return nil, fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
-	}
-
-	ws := e.store.VaultPrefix(vaultName)
 
 	// Count engrams to set progress totals.
 	engramCount := e.store.GetVaultCount(ctx, ws)

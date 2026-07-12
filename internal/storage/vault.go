@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/cockroachdb/pebble"
@@ -41,6 +42,46 @@ func (ps *PebbleStore) WriteVaultName(wsPrefix [8]byte, name string) error {
 	return nil
 }
 
+// ReserveVaultName creates a new 0x0E/0x0F mapping without using the
+// vaultNameWritten fast path. Lifecycle operations call this only after their
+// engine-level availability checks; the persisted rechecks here keep stale
+// caches or already-occupied workspace/name keys from being treated as a
+// successful reservation. This is not a compare-and-set boundary against
+// callers outside the engine's vaultOpsMu lifecycle lock.
+func (ps *PebbleStore) ReserveVaultName(wsPrefix [8]byte, name string) error {
+	idxKey := keys.VaultNameIndexKey(name)
+	_, idxCloser, err := ps.db.Get(idxKey)
+	if err == nil {
+		idxCloser.Close()
+		return fmt.Errorf("reserve vault name %q: name index already exists", name)
+	}
+	if !errors.Is(err, pebble.ErrNotFound) {
+		return fmt.Errorf("reserve vault name %q: read name index: %w", name, err)
+	}
+
+	metaKey := keys.VaultMetaKey(wsPrefix)
+	value, metaCloser, err := ps.db.Get(metaKey)
+	if err == nil {
+		owner := string(value)
+		metaCloser.Close()
+		return fmt.Errorf("reserve vault name %q: workspace already owned by vault %q", name, owner)
+	}
+	if !errors.Is(err, pebble.ErrNotFound) {
+		return fmt.Errorf("reserve vault name %q: read workspace owner: %w", name, err)
+	}
+
+	batch := ps.db.NewBatch()
+	defer batch.Close()
+	batch.Set(metaKey, []byte(name), nil)
+	batch.Set(idxKey, wsPrefix[:], nil)
+	if err := batch.Commit(nil); err != nil {
+		return fmt.Errorf("reserve vault name %q: commit: %w", name, err)
+	}
+	ps.vaultNameWritten.Store(wsPrefix, struct{}{})
+	ps.vaultPrefixCache.Add(name, wsPrefix)
+	return nil
+}
+
 // ResolveVaultPrefix looks up the actual workspace prefix for a vault name.
 // Uses an in-memory cache to avoid Pebble reads on the common hot path.
 func (ps *PebbleStore) ResolveVaultPrefix(name string) [8]byte {
@@ -64,6 +105,55 @@ func (ps *PebbleStore) ResolveVaultPrefix(name string) [8]byte {
 	ws := keys.VaultPrefix(name)
 	ps.vaultPrefixCache.Add(name, ws)
 	return ws
+}
+
+// ResolveExistingVaultPrefix strictly resolves an already-registered vault.
+// Unlike ResolveVaultPrefix, it never falls back to a name-derived SipHash and
+// never trusts the in-memory cache without re-reading persisted lifecycle keys.
+// Destructive and bulk existing-vault operations use this path so a missing,
+// corrupt, or mismatched 0x0F/0x0E pair fails closed.
+func (ps *PebbleStore) ResolveExistingVaultPrefix(name string) ([8]byte, error) {
+	idxKey := keys.VaultNameIndexKey(name)
+	value, closer, err := ps.db.Get(idxKey)
+	if err != nil {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: name index: %w", name, err)
+	}
+	if len(value) != 8 {
+		closer.Close()
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: name index length %d, want 8", name, len(value))
+	}
+	var ws [8]byte
+	copy(ws[:], value)
+	closer.Close()
+
+	metaValue, metaCloser, err := ps.db.Get(keys.VaultMetaKey(ws))
+	if err != nil {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: metadata: %w", name, err)
+	}
+	storedName := string(metaValue)
+	metaCloser.Close()
+	if storedName != name {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: metadata names %q", name, storedName)
+	}
+
+	return ws, nil
+}
+
+// VaultWorkspaceOwner returns the persisted vault name that owns ws. The
+// boolean is false only when no 0x0E metadata key exists. Callers use this to
+// prevent a newly reserved name from reusing a workspace retained by a renamed
+// vault.
+func (ps *PebbleStore) VaultWorkspaceOwner(ws [8]byte) (string, bool, error) {
+	value, closer, err := ps.db.Get(keys.VaultMetaKey(ws))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	owner := string(value)
+	closer.Close()
+	return owner, true, nil
 }
 
 // BackfillVaultNames scans all 0x01 engram keys, finds vault prefixes that have
@@ -129,13 +219,24 @@ func (ps *PebbleStore) BackfillVaultNames() error {
 // VaultNameExists returns true if a vault with the given name is registered
 // (i.e. a 0x0F index key exists for the name).
 func (ps *PebbleStore) VaultNameExists(name string) bool {
+	exists, _ := ps.VaultNameIndexExists(name)
+	return exists
+}
+
+// VaultNameIndexExists reports persisted 0x0F evidence without collapsing a
+// storage read failure into ordinary absence. Strict lifecycle classification
+// uses this method; VaultNameExists remains the legacy boolean convenience API.
+func (ps *PebbleStore) VaultNameIndexExists(name string) (bool, error) {
 	idxKey := keys.VaultNameIndexKey(name)
 	_, closer, err := ps.db.Get(idxKey)
 	if err == nil {
 		closer.Close()
-		return true
+		return true, nil
 	}
-	return false
+	if errors.Is(err, pebble.ErrNotFound) {
+		return false, nil
+	}
+	return false, fmt.Errorf("read vault name index %q: %w", name, err)
 }
 
 // RenameVault atomically renames a vault by updating the two index keys
@@ -155,8 +256,13 @@ func (ps *PebbleStore) RenameVault(ws [8]byte, oldName, newName string) error {
 		return fmt.Errorf("vault name mismatch: stored %q, expected %q", storedName, oldName)
 	}
 
-	// Verify newName doesn't already exist (collision check).
-	if ps.VaultNameExists(newName) {
+	// Verify newName doesn't already exist (collision check), preserving any
+	// storage read failure instead of treating it as an available name.
+	targetExists, err := ps.VaultNameIndexExists(newName)
+	if err != nil {
+		return fmt.Errorf("rename vault: inspect target name index: %w", err)
+	}
+	if targetExists {
 		return fmt.Errorf("vault name %q already exists", newName)
 	}
 
@@ -189,7 +295,18 @@ func (ps *PebbleStore) ListVaultNames() ([]string, error) {
 		return nil, err
 	}
 	defer iter.Close()
+	return scanVaultNames(iter)
+}
 
+type vaultNameIterator interface {
+	First() bool
+	Next() bool
+	Key() []byte
+	Value() []byte
+	Error() error
+}
+
+func scanVaultNames(iter vaultNameIterator) ([]string, error) {
 	var names []string
 	for valid := iter.First(); valid; valid = iter.Next() {
 		if len(iter.Key()) == 9 && iter.Key()[0] == 0x0E {
@@ -197,6 +314,9 @@ func (ps *PebbleStore) ListVaultNames() ([]string, error) {
 			copy(val, iter.Value())
 			names = append(names, string(val))
 		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("list vault names: iterate: %w", err)
 	}
 	return names, nil
 }

@@ -76,7 +76,10 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 		limit = 200
 	}
 
-	ws := e.store.ResolveVaultPrefix(vault)
+	ws, err := e.resolveExistingVaultPrefix(vault)
+	if err != nil {
+		return nil, fmt.Errorf("replay enrichment: resolve persisted workspace: %w", err)
+	}
 
 	// Collect active engram IDs.
 	ids, err := e.store.ListByState(ctx, ws, storage.StateActive, limit)
