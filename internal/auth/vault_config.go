@@ -73,6 +73,30 @@ func (s *Store) GetVaultConfig(vault string) (VaultConfig, error) {
 	return cfg, nil
 }
 
+// LookupPublicVaultConfig performs an exact point lookup for an explicitly
+// persisted public-vault policy. Unlike GetVaultConfig, it does not synthesize
+// a locked default for a missing record. This distinction lets long-lived
+// transports fail closed when a public vault is locked, deleted, or renamed.
+func (s *Store) LookupPublicVaultConfig(vault string) (VaultConfig, error) {
+	if s == nil || s.db == nil || !ValidVaultName(vault) {
+		return VaultConfig{}, fmt.Errorf("invalid vault reference")
+	}
+	data, closer, err := s.db.Get(vaultConfigKey(vault))
+	if err != nil {
+		return VaultConfig{}, fmt.Errorf("public vault not found")
+	}
+	defer closer.Close()
+
+	var cfg VaultConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return VaultConfig{}, fmt.Errorf("corrupt vault config: %w", err)
+	}
+	if cfg.Name != vault || !ValidVaultName(cfg.Name) || !cfg.Public {
+		return VaultConfig{}, fmt.Errorf("vault is not public")
+	}
+	return cfg, nil
+}
+
 // SetVaultConfig persists the vault configuration.
 func (s *Store) SetVaultConfig(cfg VaultConfig) error {
 	if !ValidVaultName(cfg.Name) {

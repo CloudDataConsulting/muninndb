@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -81,7 +82,25 @@ func (s *Store) ValidateAPIKey(token string) (APIKey, error) {
 		return APIKey{}, fmt.Errorf("invalid token encoding")
 	}
 	h := sha256.Sum256(raw)
-	data, closer, err := s.db.Get(apiKeyStorageKey(h[:16]))
+	return s.LookupAPIKeyByStorageHash(h[:16])
+}
+
+// LookupAPIKeyByStorageHash performs a direct, collision-resistant metadata
+// lookup using the full 128-bit storage hash persisted for an API key. It is
+// intended for revalidating a key that has already been authenticated; callers
+// must not substitute the shorter display ID or scan ListAPIKeys.
+//
+// Expiration is inclusive: a key is invalid at its exact expiration instant.
+func (s *Store) LookupAPIKeyByStorageHash(storageHash []byte) (APIKey, error) {
+	return s.lookupAPIKeyByStorageHashAt(storageHash, time.Now())
+}
+
+func (s *Store) lookupAPIKeyByStorageHashAt(storageHash []byte, now time.Time) (APIKey, error) {
+	if s == nil || s.db == nil || len(storageHash) != 16 {
+		return APIKey{}, fmt.Errorf("invalid key reference")
+	}
+
+	data, closer, err := s.db.Get(apiKeyStorageKey(storageHash))
 	if err != nil {
 		return APIKey{}, fmt.Errorf("invalid key")
 	}
@@ -91,13 +110,21 @@ func (s *Store) ValidateAPIKey(token string) (APIKey, error) {
 	if err := json.Unmarshal(data, &key); err != nil {
 		return APIKey{}, fmt.Errorf("corrupt key record: %w", err)
 	}
+	if len(key.StorageHash) != 16 || subtle.ConstantTimeCompare(key.StorageHash, storageHash) != 1 {
+		return APIKey{}, fmt.Errorf("corrupt api key storage hash")
+	}
+	id, err := base64.RawURLEncoding.DecodeString(key.ID)
+	if err != nil || len(id) != 8 || base64.RawURLEncoding.EncodeToString(id) != key.ID ||
+		subtle.ConstantTimeCompare(id, storageHash[:8]) != 1 {
+		return APIKey{}, fmt.Errorf("corrupt api key ID")
+	}
 	if !ValidVaultName(key.Vault) {
 		return APIKey{}, fmt.Errorf("corrupt api key vault scope")
 	}
 	if key.Mode != ModeFull && key.Mode != ModeObserve && key.Mode != ModeWrite {
 		return APIKey{}, fmt.Errorf("corrupt api key mode")
 	}
-	if key.ExpiresAt != nil && time.Now().After(*key.ExpiresAt) {
+	if key.ExpiresAt != nil && !now.Before(*key.ExpiresAt) {
 		return APIKey{}, fmt.Errorf("api key has expired")
 	}
 	return key, nil
