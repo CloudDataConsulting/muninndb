@@ -62,7 +62,7 @@ func allToolDefinitions() []ToolDefinition {
 					},
 					"op_id": map[string]any{
 						"type":        "string",
-						"description": "Optional idempotency key. If set and a receipt exists for this key, the cached engram ID is returned without re-creating.",
+						"description": "Optional durable idempotency key, scoped to the vault. An identical retry returns the original engram ID; reusing it with changed content fails.",
 					},
 				},
 				"required": []string{"content"},
@@ -88,6 +88,10 @@ func allToolDefinitions() []ToolDefinition {
 								"created_at": map[string]any{"type": "string", "description": "ISO 8601 timestamp. Defaults to now."},
 								"type":       map[string]any{"type": "string", "description": "Memory type — built-in name or free-form label."},
 								"type_label": map[string]any{"type": "string", "description": "Explicit free-form type label."},
+								"op_id": map[string]any{
+									"type":        "string",
+									"description": "Optional durable idempotency key for this item, scoped to the vault.",
+								},
 								"summary":    map[string]any{"type": "string", "description": "One-line summary. Skips background summarization."},
 								"entities": map[string]any{
 									"type": "array",

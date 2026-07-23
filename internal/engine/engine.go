@@ -44,6 +44,8 @@ type CognitiveForwarder interface {
 // Engine is the cognitive database engine implementing mbp.EngineAPI.
 type Engine struct {
 	store            *storage.PebbleStore
+	identityModeMu   sync.RWMutex
+	clusterMode      atomic.Bool
 	authStore        *auth.Store // nil = use Plasticity defaults (e.g. in tests)
 	fts              *fts.Index
 	ftsWorker        *fts.Worker  // async FTS indexing — decoupled from write hot path
@@ -339,6 +341,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		jobManager:          vaultjob.NewManager(),
 		replayFailCounts:    make(map[storage.ULID]int),
 	}
+	e.clusterMode.Store(cfg.ClusterMode)
 	// Start async novelty worker to decouple O(N) Jaccard scan from write hot path.
 	// engine:spawn-ok — tracked by noveltyDone channel, drained in Stop()
 	go e.runNoveltyWorker()
@@ -738,15 +741,15 @@ func (e *Engine) Hello(ctx context.Context, req *mbp.HelloRequest) (*mbp.HelloRe
 
 // Write implements mbp.EngineAPI.Write.
 func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("write request must not be nil")
+	}
 	writeStart := time.Now()
-	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+	vaultName := canonicalVaultName(req.Vault)
+	wsPrefix := e.store.ResolveVaultPrefix(vaultName)
 	e.activity.Record(wsPrefix)
 
 	// Resolve inline enrichment mode for this vault.
-	vaultName := req.Vault
-	if vaultName == "" {
-		vaultName = "default"
-	}
 	resolved := e.ResolveVaultPlasticity(vaultName)
 	inlineMode := resolved.InlineEnrichment
 
@@ -806,10 +809,35 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	}
 	eng.Associations = assocs
 
-	// Write to store
-	id, err := e.store.WriteEngram(ctx, wsPrefix, eng)
+	// Write to store. Externally identified writes atomically bind the
+	// canonical payload to the engram and return the original ID on retries.
+	var id storage.ULID
+	var reused bool
+	var err error
+	if req.IdempotentID != "" {
+		payloadHash, hashErr := externalIdentityPayloadHash(req)
+		if hashErr != nil {
+			return nil, hashErr
+		}
+		e.identityModeMu.RLock()
+		if e.clusterMode.Load() {
+			e.identityModeMu.RUnlock()
+			return nil, ErrExternalIdentityClusterUnsupported
+		}
+		id, reused, err = e.store.WriteEngramWithExternalIdentity(ctx, wsPrefix, eng, req.IdempotentID, payloadHash)
+		e.identityModeMu.RUnlock()
+	} else {
+		id, err = e.store.WriteEngram(ctx, wsPrefix, eng)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("write engram: %w", err)
+	}
+	if reused {
+		existing, readErr := e.store.GetEngram(ctx, wsPrefix, id)
+		if readErr != nil {
+			return nil, fmt.Errorf("read idempotent engram: %w", readErr)
+		}
+		return &mbp.WriteResponse{ID: id.String(), CreatedAt: existing.CreatedAt.UnixNano()}, nil
 	}
 
 	// Store caller-provided inline entities in the entity table (not as KeyPoints).
@@ -1056,7 +1084,7 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 
 	return &mbp.WriteResponse{
 		ID:        id.String(),
-		CreatedAt: time.Now().UnixNano(),
+		CreatedAt: eng.CreatedAt.UnixNano(),
 	}, nil
 }
 
@@ -1096,6 +1124,19 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 
 	responses := make([]*mbp.WriteResponse, n)
 	errs := make([]error, n)
+	identityModeLocked := false
+	for _, req := range reqs {
+		if req != nil && req.IdempotentID != "" {
+			e.identityModeMu.RLock()
+			identityModeLocked = true
+			break
+		}
+	}
+	defer func() {
+		if identityModeLocked {
+			e.identityModeMu.RUnlock()
+		}
+	}()
 
 	// Phase 1: Prepare all engrams (pure computation, no I/O).
 	items := make([]storage.EngramBatchItem, n)
@@ -1103,13 +1144,14 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 	validCount := 0
 
 	for i, req := range reqs {
-		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
+		if req == nil {
+			errs[i] = fmt.Errorf("write request must not be nil")
+			continue
+		}
+		vaultName := canonicalVaultName(req.Vault)
+		wsPrefix := e.store.ResolveVaultPrefix(vaultName)
 		e.activity.Record(wsPrefix)
 
-		vaultName := req.Vault
-		if vaultName == "" {
-			vaultName = "default"
-		}
 		resolved := e.ResolveVaultPlasticity(vaultName)
 		inlineMode := resolved.InlineEnrichment
 
@@ -1170,7 +1212,21 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		callerProvidedAny := callerSummary != "" || len(callerEntities) > 0
 		skipBG := (inlineMode == "caller_only" && callerProvidedAny) || inlineMode == "disabled"
 
-		items[i] = storage.EngramBatchItem{WSPrefix: wsPrefix, Engram: eng}
+		item := storage.EngramBatchItem{WSPrefix: wsPrefix, Engram: eng}
+		if req.IdempotentID != "" {
+			if e.clusterMode.Load() {
+				errs[i] = ErrExternalIdentityClusterUnsupported
+				continue
+			}
+			payloadHash, hashErr := externalIdentityPayloadHash(req)
+			if hashErr != nil {
+				errs[i] = hashErr
+				continue
+			}
+			item.ExternalID = req.IdempotentID
+			item.PayloadHash = payloadHash
+		}
+		items[i] = item
 		prepared[i] = preparedBatchItem{
 			wsPrefix:                  wsPrefix,
 			vaultName:                 vaultName,
@@ -1186,7 +1242,11 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 	}
 
 	// Phase 2: Single Pebble batch commit for all valid engrams.
-	ids, batchErrs := e.store.WriteEngramBatch(ctx, items)
+	ids, reused, batchErrs := e.store.WriteEngramBatchWithExternalIdentity(ctx, items)
+	if identityModeLocked {
+		e.identityModeMu.RUnlock()
+		identityModeLocked = false
+	}
 	for i := range reqs {
 		if errs[i] != nil {
 			continue // already failed in prepare phase
@@ -1195,15 +1255,21 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			errs[i] = fmt.Errorf("write engram: %w", batchErrs[i])
 			continue
 		}
-		responses[i] = &mbp.WriteResponse{
-			ID:        ids[i].String(),
-			CreatedAt: time.Now().UnixNano(),
+		createdAt := prepared[i].eng.CreatedAt
+		if reused[i] {
+			existing, readErr := e.store.GetEngram(ctx, prepared[i].wsPrefix, ids[i])
+			if readErr != nil {
+				errs[i] = fmt.Errorf("read idempotent engram: %w", readErr)
+				continue
+			}
+			createdAt = existing.CreatedAt
 		}
+		responses[i] = &mbp.WriteResponse{ID: ids[i].String(), CreatedAt: createdAt.UnixNano()}
 	}
 
 	// Phase 3: Post-commit async work for each successfully written engram.
 	for i := range reqs {
-		if errs[i] != nil {
+		if errs[i] != nil || reused[i] {
 			continue
 		}
 		p := &prepared[i]
@@ -2964,4 +3030,3 @@ func (e *Engine) RecordFeedback(ctx context.Context, vault, engramID string, use
 	})
 	return nil
 }
-

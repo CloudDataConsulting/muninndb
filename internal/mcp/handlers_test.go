@@ -164,24 +164,30 @@ func (e *noPluginsEngine) RetryEnrich(_ context.Context, _ string, id string) (*
 	}, nil
 }
 
-// idempotentEngine is a fake engine that records Write calls and supports
-// configurable CheckIdempotency responses for testing the op_id path.
+// idempotentEngine records whether MCP delegates op_id to the engine's durable
+// Write contract rather than consulting legacy 0x19 receipts itself.
 type idempotentEngine struct {
 	fakeEngine
-	receipt   *storage.IdempotencyReceipt // non-nil → return this on CheckIdempotency
-	writeCalls int
+	receipt           *storage.IdempotencyReceipt
+	writeCalls        int
+	checkCalls        int
+	receiptWriteCalls int
+	lastReq           *mbp.WriteRequest
 }
 
 func (e *idempotentEngine) CheckIdempotency(_ context.Context, _ string) (*storage.IdempotencyReceipt, error) {
+	e.checkCalls++
 	return e.receipt, nil
 }
 
 func (e *idempotentEngine) WriteIdempotency(_ context.Context, _, _ string) error {
+	e.receiptWriteCalls++
 	return nil
 }
 
-func (e *idempotentEngine) Write(_ context.Context, _ *mbp.WriteRequest) (*mbp.WriteResponse, error) {
+func (e *idempotentEngine) Write(_ context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
 	e.writeCalls++
+	e.lastReq = req
 	return &mbp.WriteResponse{ID: "fresh-id"}, nil
 }
 
@@ -1449,10 +1455,10 @@ func TestHandleWhereLeftOff_LimitCapped(t *testing.T) {
 
 // ── op_id idempotency ─────────────────────────────────────────────────────────
 
-// TestHandleRemember_IdempotentHit verifies that when CheckIdempotency finds a
-// receipt for the given op_id, the cached engram ID is returned immediately
-// with "idempotent":true and the engine's Write method is NOT called.
-func TestHandleRemember_IdempotentHit(t *testing.T) {
+// TestHandleRemember_LegacyReceiptIgnored verifies that legacy global 0x19
+// receipts are not authoritative for the new vault-scoped identity contract.
+// MCP must pass op_id to Write and let the engine resolve the durable binding.
+func TestHandleRemember_LegacyReceiptIgnored(t *testing.T) {
 	eng := &idempotentEngine{
 		receipt: &storage.IdempotencyReceipt{EngramID: "cached-id-abc", CreatedAt: 1000000},
 	}
@@ -1469,17 +1475,14 @@ func TestHandleRemember_IdempotentHit(t *testing.T) {
 	content := extractInnerJSON(t, resp)
 
 	id, ok := content["id"].(string)
-	if !ok || id != "cached-id-abc" {
-		t.Errorf("expected id='cached-id-abc', got %v", content["id"])
+	if !ok || id != "fresh-id" {
+		t.Errorf("expected id='fresh-id', got %v", content["id"])
 	}
-
-	idempotent, ok := content["idempotent"].(bool)
-	if !ok || !idempotent {
-		t.Errorf("expected idempotent=true, got %v", content["idempotent"])
+	if eng.writeCalls != 1 || eng.lastReq == nil || eng.lastReq.IdempotentID != "my-unique-op" {
+		t.Fatalf("Write delegation: calls=%d req=%+v", eng.writeCalls, eng.lastReq)
 	}
-
-	if eng.writeCalls != 0 {
-		t.Errorf("expected Write to not be called on idempotent hit, got %d calls", eng.writeCalls)
+	if eng.checkCalls != 0 || eng.receiptWriteCalls != 0 {
+		t.Fatalf("legacy receipt methods called: checks=%d writes=%d", eng.checkCalls, eng.receiptWriteCalls)
 	}
 }
 
@@ -1511,6 +1514,9 @@ func TestHandleRemember_IdempotentMiss(t *testing.T) {
 	if eng.writeCalls != 1 {
 		t.Errorf("expected Write to be called once, got %d", eng.writeCalls)
 	}
+	if eng.lastReq == nil || eng.lastReq.IdempotentID != "new-unique-op" {
+		t.Fatalf("op_id not delegated to Write: %+v", eng.lastReq)
+	}
 }
 
 // TestHandleRemember_NoOpID verifies that muninn_remember without op_id
@@ -1530,16 +1536,45 @@ func TestHandleRemember_NoOpID(t *testing.T) {
 	if eng.writeCalls != 1 {
 		t.Errorf("expected Write to be called once, got %d", eng.writeCalls)
 	}
+	if eng.lastReq == nil || eng.lastReq.IdempotentID != "" {
+		t.Fatalf("unexpected external identity: %+v", eng.lastReq)
+	}
 }
 
-// slowIdempotentEngine is like idempotentEngine but introduces a brief delay in
-// Write so that a concurrent goroutine has time to reach the CheckIdempotency
-// gate while the first goroutine is inside Write. Without the per-op_id mutex
-// in handleRemember, both goroutines would see a nil receipt and each call
-// Write — producing two engrams for a single op_id.
+type batchIdentityCaptureEngine struct {
+	fakeEngine
+	reqs []*mbp.WriteRequest
+}
+
+func (e *batchIdentityCaptureEngine) WriteBatch(_ context.Context, reqs []*mbp.WriteRequest) ([]*mbp.WriteResponse, []error) {
+	e.reqs = reqs
+	responses := make([]*mbp.WriteResponse, len(reqs))
+	for i := range responses {
+		responses[i] = &mbp.WriteResponse{ID: fmt.Sprintf("id-%d", i)}
+	}
+	return responses, make([]error, len(reqs))
+}
+
+func TestHandleRememberBatch_ForwardsPerItemOpID(t *testing.T) {
+	eng := &batchIdentityCaptureEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember_batch","arguments":{"vault":"client","memories":[{"content":"a","op_id":"event-a"},{"content":"b","op_id":"event-b"}]}}}`
+	resp := decodeResp(t, postRPC(t, srv, body).Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if len(eng.reqs) != 2 || eng.reqs[0].IdempotentID != "event-a" || eng.reqs[1].IdempotentID != "event-b" {
+		t.Fatalf("forwarded requests = %+v", eng.reqs)
+	}
+}
+
+// slowIdempotentEngine models the engine-owned durable identity contract: MCP
+// may call Write concurrently, while the engine returns one stable target ID.
 type slowIdempotentEngine struct {
-	mu        sync.Mutex
-	writeCalls int32 // accessed atomically
+	mu          sync.Mutex
+	writeCalls  int32
+	createCalls int32
+	storedID    string
 
 	// storedReceipt is written after the first Write completes; subsequent
 	// CheckIdempotency calls inside the lock will see it.
@@ -1564,11 +1599,20 @@ func (e *slowIdempotentEngine) WriteIdempotency(_ context.Context, opID, engramI
 	return nil
 }
 
-func (e *slowIdempotentEngine) Write(_ context.Context, _ *mbp.WriteRequest) (*mbp.WriteResponse, error) {
+func (e *slowIdempotentEngine) Write(_ context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
 	atomic.AddInt32(&e.writeCalls, 1)
-	// Small sleep so a concurrent goroutine can race toward CheckIdempotency.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if req.IdempotentID != "race-op-123" {
+		return nil, fmt.Errorf("unexpected idempotent ID %q", req.IdempotentID)
+	}
+	if e.storedID != "" {
+		return &mbp.WriteResponse{ID: e.storedID}, nil
+	}
 	time.Sleep(5 * time.Millisecond)
-	return &mbp.WriteResponse{ID: "idempotent-engram"}, nil
+	atomic.AddInt32(&e.createCalls, 1)
+	e.storedID = "idempotent-engram"
+	return &mbp.WriteResponse{ID: e.storedID}, nil
 }
 
 // Delegate everything else to fakeEngine.
@@ -1686,10 +1730,8 @@ func (e *slowIdempotentEngine) ListEntities(ctx context.Context, vault string, l
 }
 
 // TestHandleRemember_ConcurrentSameOpID verifies that two concurrent
-// muninn_remember calls carrying the same op_id do not produce duplicate
-// engrams. The per-op_id mutex in handleRemember ensures only one Write
-// executes; the second goroutine must observe the cached receipt and return
-// the same engram ID with idempotent=true.
+// muninn_remember calls carrying the same op_id delegate both calls to the
+// engine, which owns concurrency and returns one stable engram identity.
 func TestHandleRemember_ConcurrentSameOpID(t *testing.T) {
 	eng := &slowIdempotentEngine{}
 	srv := newTestServerWith(eng)
@@ -1727,10 +1769,11 @@ func TestHandleRemember_ConcurrentSameOpID(t *testing.T) {
 		t.Errorf("concurrent op_id produced different engram IDs: %q vs %q — TOCTOU race not fixed", results[0].id, results[1].id)
 	}
 
-	// Write must have been called exactly once; the second goroutine must have
-	// hit the receipt cache inside the lock.
-	if calls := atomic.LoadInt32(&eng.writeCalls); calls != 1 {
-		t.Errorf("expected exactly 1 Write call, got %d — duplicate engrams were created", calls)
+	if calls := atomic.LoadInt32(&eng.writeCalls); calls != 2 {
+		t.Errorf("expected MCP to delegate both calls, got %d", calls)
+	}
+	if creates := atomic.LoadInt32(&eng.createCalls); creates != 1 {
+		t.Errorf("engine created %d engrams, want 1", creates)
 	}
 }
 

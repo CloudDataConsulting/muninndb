@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -18,26 +17,6 @@ import (
 
 func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
 	opID, _ := args["op_id"].(string)
-	if opID != "" {
-		// Acquire a per-op_id mutex to prevent TOCTOU races: without this lock,
-		// two concurrent requests with the same op_id could both pass the nil
-		// receipt check and each call Write, producing duplicate engrams.
-		// defer mu.Unlock() holds the lock until the handler returns, covering
-		// the entire check→write→store-receipt window.
-		mu := s.getIdempotencyLock(opID)
-		mu.Lock()
-		defer mu.Unlock()
-
-		// Re-check inside lock (now safe from concurrent duplicates).
-		if receipt, err := s.engine.CheckIdempotency(ctx, opID); err == nil && receipt != nil {
-			out, _ := json.Marshal(map[string]any{
-				"id":         receipt.EngramID,
-				"idempotent": true,
-			})
-			sendResult(w, id, textContent(string(out)))
-			return
-		}
-	}
 
 	content, ok := args["content"].(string)
 	if !ok || strings.TrimSpace(content) == "" {
@@ -45,8 +24,9 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		return
 	}
 	req := &mbp.WriteRequest{
-		Vault:   vault,
-		Content: content,
+		Vault:        vault,
+		Content:      content,
+		IdempotentID: opID,
 	}
 	if c, ok := args["concept"].(string); ok {
 		req.Concept = c
@@ -84,11 +64,6 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
-	}
-	if opID != "" {
-		if err := s.engine.WriteIdempotency(ctx, opID, resp.ID); err != nil {
-			slog.Warn("mcp: failed to record idempotency receipt", "op_id", opID, "engram_id", resp.ID, "err", err)
-		}
 	}
 	result := WriteResult{ID: resp.ID, Concept: req.Concept}
 	if len(content) > 500 {
@@ -130,6 +105,9 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 		req := &mbp.WriteRequest{
 			Vault:   vault,
 			Content: content,
+		}
+		if opID, ok := m["op_id"].(string); ok {
+			req.IdempotentID = opID
 		}
 		if c, ok := m["concept"].(string); ok {
 			req.Concept = c

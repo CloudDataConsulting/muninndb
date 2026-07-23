@@ -52,6 +52,9 @@ func TestKeyPrefixesAreUnique(t *testing.T) {
 		{"RelationshipKey", RelationshipKey([8]byte{}, [16]byte{}, [8]byte{}, 0x01, [8]byte{})},
 		{"EntityReverseIndexKey", EntityReverseIndexKey([8]byte{}, [8]byte{}, [16]byte{})},
 		{"LastAccessIndexKey", LastAccessIndexKey([8]byte{}, 0, [16]byte{})},
+		{"ArchiveAssocKey", ArchiveAssocKey([8]byte{}, [16]byte{}, [16]byte{})},
+		{"RelEntityIndexKey", RelEntityIndexKey([8]byte{}, [8]byte{}, [16]byte{})},
+		{"ExternalIdentityKey", ExternalIdentityKey([8]byte{}, "event-1")},
 	}
 
 	seen := make(map[byte]string)
@@ -65,6 +68,31 @@ func TestKeyPrefixesAreUnique(t *testing.T) {
 			t.Errorf("prefix 0x%02X used by both %s and %s", prefix, prev, pk.name)
 		}
 		seen[prefix] = pk.name
+	}
+}
+
+func TestExternalIdentityKeyLayoutAndScope(t *testing.T) {
+	wsA := [8]byte{0xAA, 0xBB}
+	wsB := [8]byte{0xCC, 0xDD}
+	keyA := ExternalIdentityKey(wsA, "source:event:123")
+	keyARepeat := ExternalIdentityKey(wsA, "source:event:123")
+	keyB := ExternalIdentityKey(wsB, "source:event:123")
+	keyOtherID := ExternalIdentityKey(wsA, "source:event:124")
+	if len(keyA) != 41 || keyA[0] != 0x27 {
+		t.Fatalf("key layout = len %d prefix 0x%02x, want len 41 prefix 0x27", len(keyA), keyA[0])
+	}
+	if !bytes.Equal(keyA[1:9], wsA[:]) {
+		t.Fatalf("workspace bytes = %x, want %x", keyA[1:9], wsA)
+	}
+	if !bytes.Equal(keyA, keyARepeat) {
+		t.Fatal("same identity did not produce deterministic key")
+	}
+	if bytes.Equal(keyA, keyB) || bytes.Equal(keyA, keyOtherID) {
+		t.Fatal("vault or identity did not affect key")
+	}
+	prefix := ExternalIdentityPrefix(wsA)
+	if len(prefix) != 9 || !bytes.Equal(keyA[:9], prefix) {
+		t.Fatalf("prefix %x is not key prefix for %x", prefix, keyA)
 	}
 }
 

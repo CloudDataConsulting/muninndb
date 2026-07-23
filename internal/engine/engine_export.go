@@ -15,6 +15,9 @@ import (
 // Returns an ExportResult with engram count and total key count.
 // Returns ErrVaultNotFound if the vault does not exist.
 func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel string, dimension int, resetMeta bool, w io.Writer) (*storage.ExportResult, error) {
+	e.identityModeMu.Lock()
+	defer e.identityModeMu.Unlock()
+
 	names, err := e.store.ListVaultNames()
 	if err != nil {
 		return nil, fmt.Errorf("export vault: list vaults: %w", err)
@@ -30,7 +33,7 @@ func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel strin
 		return nil, fmt.Errorf("export vault %q: %w", vaultName, ErrVaultNotFound)
 	}
 
-	ws := e.store.VaultPrefix(vaultName)
+	ws := e.store.ResolveVaultPrefix(vaultName)
 	opts := storage.ExportOpts{
 		EmbedderModel: embedderModel,
 		Dimension:     dimension,

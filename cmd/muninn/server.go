@@ -881,6 +881,19 @@ func runServer() {
 
 	// Build storage layer
 	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 10000})
+	if clusterCfg.Enabled {
+		hasExternalIdentities, identityErr := store.HasAnyExternalIdentities(context.Background())
+		if identityErr != nil {
+			slog.Error("cluster safety check for durable external identities failed", "err", identityErr)
+			store.Close()
+			os.Exit(1)
+		}
+		if hasExternalIdentities {
+			slog.Error("cluster mode cannot start while durable external identities exist; 0x27 replication is not implemented")
+			store.Close()
+			os.Exit(1)
+		}
+	}
 
 	// Run startup migrations before the engine is built.
 	runStartupMigrations(context.Background(), store)
@@ -987,6 +1000,7 @@ func runServer() {
 		ConfidenceWorker: confidenceWorkerImpl.Worker,
 		Embedder:         embedder,
 		HNSWRegistry:     hnswRegistry,
+		ClusterMode:      clusterCfg.Enabled,
 	})
 
 	eng.SetTransitionWorker(transitionWorkerImpl)
@@ -1165,6 +1179,9 @@ func runServer() {
 	// Wire coordinator factory so the admin enable endpoint can start cluster
 	// at runtime (without a restart) when cluster.yaml is written via the UI/CLI.
 	restServer.SetCoordinatorFactory(func(_ context.Context, cfg plugincfg.ClusterConfig) (*replication.ClusterCoordinator, error) {
+		if identityErr := eng.EnableClusterMode(context.Background()); identityErr != nil {
+			return nil, identityErr
+		}
 		repLog := replication.NewReplicationLog(db)
 		applier := replication.NewApplier(db)
 		epochStore, err := replication.NewEpochStore(db)

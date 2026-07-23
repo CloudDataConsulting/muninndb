@@ -63,7 +63,8 @@ components:
           default: "default"
         idempotent_id:
           type: string
-          description: "Caller-assigned deduplication key."
+          maxLength: 1024
+          description: "Durable caller-assigned identity scoped to the resolved vault. Identical retries return the original engram ID; changed payloads return HTTP 409."
         memory_type:
           type: integer
           format: uint8
@@ -1552,7 +1553,19 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
-          description: "Idempotency key collision."
+          description: "External identity already exists with a different canonical payload."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: "External identity payload contains caller-owned auxiliary data that cannot yet be committed atomically."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: "External identities are unavailable while cluster mode is active."
           content:
             application/json:
               schema:

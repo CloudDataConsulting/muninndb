@@ -23,4 +23,8 @@ type EngineConfig struct {
 	ConfidenceWorker *cognitive.Worker[cognitive.ConfidenceUpdate]  // nil → no confidence decay
 	Embedder         activation.Embedder                            // nil → no semantic search
 	HNSWRegistry     *hnsw.Registry                                 // nil → no HNSW indexes
+	// ClusterMode rejects durable external-identity writes until the 0x27
+	// namespace participates in replication. Standalone/embedded engines leave
+	// this false.
+	ClusterMode bool
 }

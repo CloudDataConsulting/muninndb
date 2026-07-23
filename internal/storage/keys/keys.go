@@ -1,6 +1,7 @@
 package keys
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -699,6 +700,29 @@ func RelEntityIndexPrefix(ws [8]byte, entityHash [8]byte) []byte {
 	key[0] = 0x26
 	copy(key[1:9], ws[:])
 	copy(key[9:17], entityHash[:])
+	return key
+}
+
+// ExternalIdentityKey constructs the durable, vault-scoped external identity
+// key (0x27 prefix). The caller-provided identity is SHA-256 hashed to keep
+// Pebble keys fixed-size; the unabridged identity is stored in the value so a
+// theoretical digest collision is detected and rejected rather than aliased.
+// Key: 0x27 | ws(8) | sha256(externalID)(32) = 41 bytes.
+func ExternalIdentityKey(ws [8]byte, externalID string) []byte {
+	digest := sha256.Sum256([]byte(externalID))
+	key := make([]byte, 1+8+len(digest))
+	key[0] = 0x27
+	copy(key[1:9], ws[:])
+	copy(key[9:], digest[:])
+	return key
+}
+
+// ExternalIdentityPrefix returns the 9-byte scan prefix covering all durable
+// external identities in a vault (0x27 | ws(8)).
+func ExternalIdentityPrefix(ws [8]byte) []byte {
+	key := make([]byte, 1+8)
+	key[0] = 0x27
+	copy(key[1:9], ws[:])
 	return key
 }
 

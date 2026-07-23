@@ -375,6 +375,12 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 // DeleteEngram performs a hard delete: removes the engram, all association keys,
 // and all secondary indexes. Reads the engram first to gather index data.
 func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id ULID) error {
+	unlock, lockErr := ps.lockExternalIdentity(ctx)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock()
+
 	// Read engram to collect secondary index data for cleanup.
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
@@ -383,6 +389,9 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		defer batch.Close()
 		batch.Delete(keys.EngramKey(wsPrefix, [16]byte(id)), nil)
 		batch.Delete(keys.MetaKey(wsPrefix, [16]byte(id)), nil)
+		if identityErr := ps.deleteExternalIdentityMappingsForEngram(ctx, wsPrefix, id, batch); identityErr != nil {
+			return identityErr
+		}
 		ps.cache.Delete(wsPrefix, id)
 		return batch.Commit(pebble.NoSync)
 	}
@@ -393,6 +402,9 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	// Primary records
 	batch.Delete(keys.EngramKey(wsPrefix, [16]byte(id)), nil)
 	batch.Delete(keys.MetaKey(wsPrefix, [16]byte(id)), nil)
+	if identityErr := ps.deleteExternalIdentityMappingsForEngram(ctx, wsPrefix, id, batch); identityErr != nil {
+		return identityErr
+	}
 
 	// Secondary indexes
 	batch.Delete(keys.StateIndexKey(wsPrefix, uint8(eng.State), [16]byte(id)), nil)

@@ -73,6 +73,12 @@ func (ps *PebbleStore) CloneVaultData(
 	wsSource, wsTarget [8]byte,
 	onCopy func(copied int64),
 ) (int64, error) {
+	identityUnlock, err := ps.guardExternalIdentityLifecycle(ctx, wsSource, "clone")
+	if err != nil {
+		return 0, err
+	}
+	defer identityUnlock()
+
 	wsSourceNext, err := incrementWS(wsSource)
 	if err != nil {
 		return 0, fmt.Errorf("clone: %w", err)
@@ -279,6 +285,12 @@ func (ps *PebbleStore) MergeVaultData(
 	wsSource, wsTarget [8]byte,
 	onCopy func(copied int64),
 ) (int64, error) {
+	identityUnlock, err := ps.guardExternalIdentityLifecycle(ctx, wsSource, "merge")
+	if err != nil {
+		return 0, err
+	}
+	defer identityUnlock()
+
 	wsSourceNext, err := incrementWS(wsSource)
 	if err != nil {
 		return 0, fmt.Errorf("merge: %w", err)

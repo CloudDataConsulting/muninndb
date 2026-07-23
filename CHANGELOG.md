@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Durable vault-scoped external identities (`idempotent_id` / MCP `op_id`) now bind the canonical payload and engram atomically, return a stable target ID on retries, and reject conflicting reuse. Cluster and identity-bearing vault lifecycle operations fail closed until replication and portable collision policies are implemented.
+
 ### Fixed
 - Enrich now accepts OpenAI-compatible JSON responses returned in `message.reasoning` when `message.content` is empty, including structured reasoning payloads.
 - Retry and retroactive enrichment now only mark entity and relationship stages complete after successful persistence, avoiding partial-state retries, nil-result crashes, and silent graph-write failures.

@@ -66,6 +66,12 @@ func (ps *PebbleStore) ExportVaultData(
 	opts ExportOpts,
 	w io.Writer,
 ) (*ExportResult, error) {
+	identityUnlock, err := ps.guardExternalIdentityLifecycle(ctx, ws, "export")
+	if err != nil {
+		return nil, err
+	}
+	defer identityUnlock()
+
 	wsNext, err := incrementWS(ws)
 	if err != nil {
 		return nil, fmt.Errorf("export: %w", err)
@@ -371,6 +377,10 @@ func (ps *PebbleStore) ImportVaultData(
 					return nil, fmt.Errorf("import: read key len: %w", err)
 				}
 				keyLen := binary.BigEndian.Uint32(lenBuf[:])
+				if keyLen == 0 {
+					batch.Close()
+					return nil, fmt.Errorf("import: empty key")
+				}
 
 				strippedKey := make([]byte, keyLen)
 				if _, err := io.ReadFull(teeR, strippedKey); err != nil {
@@ -391,14 +401,18 @@ func (ps *PebbleStore) ImportVaultData(
 					return nil, fmt.Errorf("import: read val: %w", err)
 				}
 
+				prefix := strippedKey[0]
+				if prefix == 0x27 {
+					batch.Close()
+					return nil, fmt.Errorf("%w: import", ErrExternalIdentityLifecycleUnsupported)
+				}
+
 				// Reconstruct full key: insert the 8 ws bytes at positions 1-8.
 				// strippedKey = [prefix_byte][rest...], len >= 1
 				fullKey := make([]byte, 1+8+len(strippedKey)-1)
 				fullKey[0] = strippedKey[0]
 				copy(fullKey[1:9], wsTarget[:])
 				copy(fullKey[9:], strippedKey[1:])
-
-				prefix := strippedKey[0]
 
 				// Deduplication: for EngramKey (0x01), check if this engram already exists
 				// in the target vault. If it does, record its ID in skipIDs so that all

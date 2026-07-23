@@ -14,6 +14,18 @@ import (
 // Returns the job immediately (202 pattern). The clone runs in a background goroutine.
 // Returns an error if sourceVault does not exist or newName already exists.
 func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*vaultjob.Job, error) {
+	// Hold the exclusive external-identity gate from preflight through the
+	// asynchronous copy. This closes the check→reserve→copy race that could
+	// otherwise leave an empty reserved target if an identity arrived between
+	// StartClone and CloneVaultData.
+	e.identityModeMu.Lock()
+	identityLockHeld := true
+	defer func() {
+		if identityLockHeld {
+			e.identityModeMu.Unlock()
+		}
+	}()
+
 	// I3: Hold vaultOpsMu for the entire check+reserve window so that a
 	// concurrent clone/delete cannot race between the existence check and the
 	// WriteVaultName reservation.
@@ -40,6 +52,14 @@ func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*
 	if targetExists {
 		return nil, fmt.Errorf("start clone: target vault %q: %w", newName, ErrVaultNameCollision)
 	}
+	wsSource := e.store.ResolveVaultPrefix(sourceVault)
+	hasExternalIdentities, err := e.store.HasExternalIdentities(ctx, wsSource)
+	if err != nil {
+		return nil, fmt.Errorf("start clone: check durable external identities: %w", err)
+	}
+	if hasExternalIdentities {
+		return nil, fmt.Errorf("start clone: %w", storage.ErrExternalIdentityLifecycleUnsupported)
+	}
 
 	// Reserve the target vault name before releasing the mutex.
 	// CloneVaultData no longer calls WriteVaultName; we do it here atomically.
@@ -58,14 +78,15 @@ func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*
 		return nil, fmt.Errorf("start clone: %w", err)
 	}
 
-	wsSource := e.store.VaultPrefix(sourceVault)
-
 	// Count engrams in source to set CopyTotal/IndexTotal for progress tracking.
 	sourceCount := e.store.GetVaultCount(ctx, wsSource)
 	job.CopyTotal = sourceCount
 	job.IndexTotal = sourceCount
 
-	if !e.spawnJob(func() { e.runClone(job, wsSource, wsTarget, newName) }) {
+	if !e.spawnJob(func() {
+		defer e.identityModeMu.Unlock()
+		e.runClone(job, wsSource, wsTarget, newName)
+	}) {
 		e.jobManager.Fail(job, fmt.Errorf("engine is shutting down"))
 		// Do NOT call DeleteVaultNameOnly here: the engine is shutting down and
 		// Pebble may already be closed, which would panic. The orphaned vault name
@@ -74,6 +95,7 @@ func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*
 		// engrams will simply appear as an empty vault.
 		return job, nil // job is already failed; return it so the caller can report the job_id
 	}
+	identityLockHeld = false
 	return job, nil
 }
 
@@ -160,6 +182,13 @@ func (e *Engine) StartMerge(ctx context.Context, sourceVault, targetVault string
 	if sourceVault == targetVault {
 		return nil, fmt.Errorf("source and target vault must be different")
 	}
+	e.identityModeMu.Lock()
+	identityLockHeld := true
+	defer func() {
+		if identityLockHeld {
+			e.identityModeMu.Unlock()
+		}
+	}()
 
 	// I3: Hold vaultOpsMu during existence checks so a concurrent delete cannot
 	// remove a vault between our check and the goroutine launch.
@@ -186,23 +215,34 @@ func (e *Engine) StartMerge(ctx context.Context, sourceVault, targetVault string
 	if !targetFound {
 		return nil, fmt.Errorf("start merge: target vault %q: %w", targetVault, ErrVaultNotFound)
 	}
+	wsSource := e.store.ResolveVaultPrefix(sourceVault)
+	hasExternalIdentities, err := e.store.HasExternalIdentities(ctx, wsSource)
+	if err != nil {
+		return nil, fmt.Errorf("start merge: check durable external identities: %w", err)
+	}
+	if hasExternalIdentities {
+		return nil, fmt.Errorf("start merge: %w", storage.ErrExternalIdentityLifecycleUnsupported)
+	}
 
 	job, err := e.jobManager.Create("merge", sourceVault, targetVault)
 	if err != nil {
 		return nil, fmt.Errorf("start merge: %w", err)
 	}
 
-	wsSource := e.store.VaultPrefix(sourceVault)
-	wsTarget := e.store.VaultPrefix(targetVault)
+	wsTarget := e.store.ResolveVaultPrefix(targetVault)
 
 	sourceCount := e.store.GetVaultCount(ctx, wsSource)
 	job.CopyTotal = sourceCount
 	job.IndexTotal = sourceCount
 
-	if !e.spawnJob(func() { e.runMerge(job, wsSource, wsTarget, sourceVault, targetVault, deleteSource) }) {
+	if !e.spawnJob(func() {
+		defer e.identityModeMu.Unlock()
+		e.runMerge(job, wsSource, wsTarget, sourceVault, targetVault, deleteSource)
+	}) {
 		e.jobManager.Fail(job, fmt.Errorf("engine is shutting down"))
 		return job, nil // job is already failed; return it so the caller can report the job_id
 	}
+	identityLockHeld = false
 	return job, nil
 }
 

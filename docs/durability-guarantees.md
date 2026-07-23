@@ -11,6 +11,7 @@ After a crash, operators should expect all engrams and audit records to be intac
 | Operation | Tier | Data-Loss Window | Notes |
 |---|---|---|---|
 | `WriteEngram` / `WriteBatch` | Sync | Zero | Default behavior. Configurable via `NoSyncEngrams`. |
+| Durable external identity (0x27) | Sync | Zero | Same atomic batch and durability tier as its canonical engram. |
 | `scoring/Store.Save` | Sync | Zero | Vault-level Hebbian weights. |
 | `provenance/Store.Append` | Sync | Zero | Append-only audit trail. |
 | `episodic/AppendFrame` | Sync | Zero | Atomic frame + FrameCount batch. |
@@ -24,7 +25,7 @@ After a crash, operators should expect all engrams and audit records to be intac
 | Entity graph writes | NoSync + WAL syncer | ≤10ms | UpsertEntityRecord, WriteEntityEngramLink, UpsertRelationshipRecord, IncrementEntityCoOccurrence. |
 | `episodic/CreateEpisode`, `CloseEpisode` | NoSync + WAL syncer | ≤10ms | Episode lifecycle (not frame data). |
 | FTS index updates | NoSync + WAL syncer | ≤10ms | Posting lists, trigrams, term stats. |
-| Idempotency receipts | NoSync + WAL syncer | ≤10ms | Duplicate-request guard. |
+| Legacy idempotency receipts (0x19) | NoSync + WAL syncer | ≤10ms | Backward compatibility only; not authoritative for new writes. |
 | All secondary indexes | NoSync + WAL syncer | ≤10ms | Tag, state, relevance bucket, creator, last-access. |
 
 ---
@@ -65,7 +66,7 @@ These categories may lose the most recent ≤10ms of writes after a crash:
 - **Entity graph records** — entity extraction re-runs on the next relevant write or enrichment pass.
 - **FTS postings and trigram indexes** — a vault-level `ReindexFTSVault` rebuilds them from source engrams. Under normal operation, the next write to the same terms also corrects stale entries.
 - **Secondary indexes** (tag, state, relevance bucket, creator) — derived from engram metadata; self-healing on the next metadata update.
-- **Idempotency receipts** — a lost receipt means a duplicate request might be processed twice. The window is ≤10ms; in practice, clients retry on the order of seconds.
+- **Legacy idempotency receipts** — these remain best-effort only. New `idempotent_id` / MCP `op_id` writes use durable 0x27 bindings instead.
 - **Episode lifecycle records** (create/close, not frames) — the episode can be re-closed on the next session boundary.
 
 This is acceptable because every item in the NoSync tier is either derived from Sync-tier source data, statistical, or has a bounded blast radius measured in single-digit milliseconds.

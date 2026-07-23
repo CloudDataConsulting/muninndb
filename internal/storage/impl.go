@@ -74,6 +74,11 @@ type PebbleStore struct {
 	// ever seen); stripedMutex uses a constant 256 × sizeof(sync.Mutex) ≈ 6 KB.
 	entityLocks       stripedMutex // prevents TOCTOU in UpsertEntityRecord
 	coOccurrenceLocks stripedMutex // prevents TOCTOU in IncrementEntityCoOccurrence
+	// externalIdentityMu serializes durable external-identity check-and-create
+	// operations with destructive vault/engram lifecycle operations. Pebble
+	// batches provide crash atomicity; this mutex supplies the single-process
+	// conditional-insert guarantee that Pebble batches do not provide alone.
+	externalIdentityMu sync.Mutex
 	// archiveBloom is an in-memory Bloom filter over src engram IDs that have
 	// archived associations in the 0x25 namespace. Gates the 0x25 prefix scan
 	// during BFS traversal: if the filter says "no," skip the scan entirely.
@@ -211,6 +216,58 @@ func (ps *PebbleStore) VaultPrefix(vault string) [8]byte {
 // WriteEngram atomically writes the full engram record and metadata-only copy in a single Pebble batch.
 // Also writes association forward/reverse keys and secondary index entries.
 func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *Engram) (ULID, error) {
+	return ps.writeEngram(ctx, wsPrefix, eng, nil)
+}
+
+// WriteEngramWithExternalIdentity conditionally creates an engram bound to a
+// durable, vault-scoped external identity. The 0x27 identity and canonical
+// engram keys are committed in the same Pebble batch. A matching retry returns
+// the original engram ID; a changed payload fails closed.
+func (ps *PebbleStore) WriteEngramWithExternalIdentity(
+	ctx context.Context,
+	wsPrefix [8]byte,
+	eng *Engram,
+	externalID string,
+	payloadHash [32]byte,
+) (ULID, bool, error) {
+	if err := ValidateExternalIdentity(externalID); err != nil {
+		return ULID{}, false, err
+	}
+	unlock, err := ps.lockExternalIdentity(ctx)
+	if err != nil {
+		return ULID{}, false, err
+	}
+	defer unlock()
+
+	record, err := ps.getExternalIdentityRecord(wsPrefix, externalID)
+	if err != nil {
+		return ULID{}, false, err
+	}
+	if record != nil {
+		if record.PayloadHash != payloadHash {
+			return ULID{}, false, fmt.Errorf("%w: %q", ErrExternalIdentityConflict, externalID)
+		}
+		if err := ps.validateExternalIdentityTarget(wsPrefix, record); err != nil {
+			return ULID{}, false, err
+		}
+		return record.EngramID, true, nil
+	}
+
+	identity := &ExternalIdentityRecord{ExternalID: externalID, PayloadHash: payloadHash}
+	id, err := ps.writeEngram(ctx, wsPrefix, eng, identity)
+	if err != nil {
+		return ULID{}, false, err
+	}
+	return id, false, nil
+}
+
+// writeEngram is the shared implementation for ordinary and externally
+// identified writes. If identity is non-nil, the caller must hold
+// externalIdentityMu for the entire check-and-commit critical section.
+func (ps *PebbleStore) writeEngram(ctx context.Context, wsPrefix [8]byte, eng *Engram, identity *ExternalIdentityRecord) (ULID, error) {
+	if err := ctx.Err(); err != nil {
+		return ULID{}, err
+	}
 	if eng.ID == (ULID{}) {
 		if !eng.CreatedAt.IsZero() {
 			eng.ID = NewULIDWithTime(eng.CreatedAt)
@@ -298,6 +355,23 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	laKey := keys.LastAccessIndexKey(wsPrefix, laMillis, [16]byte(eng.ID))
 	batch.Set(laKey, nil, nil)
 
+	// 0x27: durable external identity. This is intentionally in the same batch
+	// as 0x01/0x02 so a crash can never leave only one side of the binding.
+	if identity != nil {
+		identity.EngramID = eng.ID
+		identityValue, err := encodeExternalIdentityRecord(*identity)
+		if err != nil {
+			return ULID{}, fmt.Errorf("encode external identity: %w", err)
+		}
+		if err := batch.Set(keys.ExternalIdentityKey(wsPrefix, identity.ExternalID), identityValue, nil); err != nil {
+			return ULID{}, fmt.Errorf("write external identity: %w", err)
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return ULID{}, err
+	}
+
 	// Commit — default: one fsync per user-submitted engram (pebble.Sync).
 	// User content is the irreplaceable asset; immediate durability is the
 	// correct tradeoff for a write-light memory store.
@@ -352,8 +426,10 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 
 // EngramBatchItem pairs a vault workspace prefix with the engram to write.
 type EngramBatchItem struct {
-	WSPrefix [8]byte
-	Engram   *Engram
+	WSPrefix    [8]byte
+	Engram      *Engram
+	ExternalID  string
+	PayloadHash [32]byte
 }
 
 // WriteEngramBatch atomically writes multiple engrams in a single Pebble batch
@@ -368,20 +444,109 @@ type EngramBatchItem struct {
 // Returns a slice of (ULID, error) per item. If the batch commit itself fails,
 // all items receive the commit error.
 func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatchItem) ([]ULID, []error) {
+	ids, _, errs := ps.WriteEngramBatchWithExternalIdentity(ctx, items)
+	return ids, errs
+}
+
+// WriteEngramBatchWithExternalIdentity extends WriteEngramBatch with durable
+// per-item external identities and a reused result bit. All newly created
+// engrams and their 0x27 bindings share one Pebble commit. Existing matching
+// identities are returned without re-running post-commit side effects.
+func (ps *PebbleStore) WriteEngramBatchWithExternalIdentity(ctx context.Context, items []EngramBatchItem) ([]ULID, []bool, []error) {
 	n := len(items)
 	ids := make([]ULID, n)
+	reused := make([]bool, n)
+	batchDependent := make([]bool, n)
 	errs := make([]error, n)
 
 	if n == 0 {
-		return ids, errs
+		return ids, reused, errs
+	}
+
+	hasExternalIdentity := false
+	for i := range items {
+		if items[i].ExternalID != "" {
+			hasExternalIdentity = true
+			break
+		}
+	}
+	if hasExternalIdentity {
+		unlock, err := ps.lockExternalIdentity(ctx)
+		if err != nil {
+			for i := range errs {
+				errs[i] = err
+			}
+			return ids, reused, errs
+		}
+		defer unlock()
 	}
 
 	batch := ps.db.NewBatch()
 	defer batch.Close()
+	type batchIdentity struct {
+		externalID  string
+		payloadHash [32]byte
+		engramID    ULID
+		persisted   bool
+	}
+	seenIdentities := make(map[string]batchIdentity)
 
 	for i := range items {
+		if err := ctx.Err(); err != nil {
+			errs[i] = err
+			continue
+		}
 		eng := items[i].Engram
 		ws := items[i].WSPrefix
+		if eng == nil {
+			errs[i] = fmt.Errorf("write engram batch: nil engram")
+			continue
+		}
+
+		var identityKey []byte
+		if items[i].ExternalID != "" {
+			if err := ValidateExternalIdentity(items[i].ExternalID); err != nil {
+				errs[i] = err
+				continue
+			}
+			identityKey = keys.ExternalIdentityKey(ws, items[i].ExternalID)
+			mapKey := string(identityKey)
+			if seen, ok := seenIdentities[mapKey]; ok {
+				if seen.externalID != items[i].ExternalID || seen.payloadHash != items[i].PayloadHash {
+					errs[i] = fmt.Errorf("%w: %q", ErrExternalIdentityConflict, items[i].ExternalID)
+					continue
+				}
+				ids[i] = seen.engramID
+				reused[i] = true
+				batchDependent[i] = !seen.persisted
+				continue
+			}
+
+			record, err := ps.getExternalIdentityRecord(ws, items[i].ExternalID)
+			if err != nil {
+				errs[i] = err
+				continue
+			}
+			if record != nil {
+				if record.PayloadHash != items[i].PayloadHash {
+					errs[i] = fmt.Errorf("%w: %q", ErrExternalIdentityConflict, items[i].ExternalID)
+					continue
+				}
+				if err := ps.validateExternalIdentityTarget(ws, record); err != nil {
+					errs[i] = err
+					continue
+				}
+				ids[i] = record.EngramID
+				reused[i] = true
+				seenIdentities[mapKey] = batchIdentity{
+					externalID:  items[i].ExternalID,
+					payloadHash: items[i].PayloadHash,
+					engramID:    record.EngramID,
+					persisted:   true,
+				}
+				continue
+			}
+		}
 
 		if eng.ID == (ULID{}) {
 			if !eng.CreatedAt.IsZero() {
@@ -460,7 +625,37 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 			continue
 		}
 
+		if items[i].ExternalID != "" {
+			record := ExternalIdentityRecord{
+				EngramID:    eng.ID,
+				PayloadHash: items[i].PayloadHash,
+				ExternalID:  items[i].ExternalID,
+			}
+			value, err := encodeExternalIdentityRecord(record)
+			if err != nil {
+				errs[i] = fmt.Errorf("encode external identity: %w", err)
+				continue
+			}
+			if err := batch.Set(identityKey, value, nil); err != nil {
+				errs[i] = fmt.Errorf("write external identity: %w", err)
+				continue
+			}
+			seenIdentities[string(identityKey)] = batchIdentity{
+				externalID:  items[i].ExternalID,
+				payloadHash: items[i].PayloadHash,
+				engramID:    eng.ID,
+			}
+		}
+
 		ids[i] = eng.ID
+	}
+	if err := ctx.Err(); err != nil {
+		for i := range errs {
+			if errs[i] == nil && (!reused[i] || batchDependent[i]) {
+				errs[i] = err
+			}
+		}
+		return ids, reused, errs
 	}
 
 	syncOption := pebble.Sync
@@ -473,12 +668,12 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 				errs[i] = fmt.Errorf("commit batch: %w", commitErr)
 			}
 		}
-		return ids, errs
+		return ids, reused, errs
 	}
 
 	// Post-commit: vault counters, WAL/MOL, provenance — per item.
 	for i := range items {
-		if errs[i] != nil {
+		if errs[i] != nil || reused[i] {
 			continue
 		}
 		eng := items[i].Engram
@@ -512,7 +707,7 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		}
 	}
 
-	return ids, errs
+	return ids, reused, errs
 }
 
 // WriteCoherence persists vault coherence counters to Pebble.

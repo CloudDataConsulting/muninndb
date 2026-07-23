@@ -1,6 +1,6 @@
 # Key-Space Schema
 
-MuninnDB stores all state in a single Pebble instance using a prefix-partitioned key space. Each prefix byte (0x01–0x24) identifies a distinct data type, and keys are constructed by dedicated functions in the `storage` package — never assembled ad hoc. Most prefixes are vault-scoped: the key begins with a workspace prefix (`wsPrefix`) derived from a SipHash of the vault name. A handful of prefixes are global (cross-vault) and omit the workspace prefix entirely.
+MuninnDB stores all state in a single Pebble instance using a prefix-partitioned key space. Each prefix byte (currently through 0x27) identifies a distinct data type, and keys are constructed by dedicated functions in the `storage` package — never assembled ad hoc. Most prefixes are vault-scoped: the key begins with a workspace prefix (`wsPrefix`) derived from a SipHash of the vault name. A handful of prefixes are global (cross-vault) and omit the workspace prefix entirely.
 
 This document is the authoritative reference for every prefix in the system. Update it before merging any change that introduces or modifies a key layout.
 
@@ -44,7 +44,7 @@ This document is the authoritative reference for every prefix in the system. Upd
 | 0x16 | Provenance | Vault | `ws(8) \| id(16) \| ts_ns(8) \| seq(4)` | NoSync | Append-only audit trail entries. |
 | 0x17 | Bucket Migration | Vault | `ws(8)` | NoSync | Tracks which relevance-bucket migration version has been applied. |
 | 0x18 | Quantized Embedding | Vault | `ws(8) \| id(16)` | NoSync | Standalone quantized vector for similarity search. |
-| 0x19 | Idempotency Receipt | Global | `siphash(op_id)(8)` | NoSync | Duplicate-request guard. TTL-expired by background sweep. |
+| 0x19 | Legacy Idempotency Receipt | Global | `siphash(op_id)(8)` | NoSync | Backward-compatible MCP receipt. TTL-expired and not authoritative for new external identities. |
 | 0x1A | Episode Record | Vault | `ws(8) \| episodeID(16)` | NoSync | Episode metadata (create/close lifecycle). |
 | 0x1A+0xFF | Episode Frame | Vault | `ws(8) \| episodeID(16) \| 0xFF \| position(4)` | **Sync** | Ordered frame within an episode. 0xFF separator distinguishes frames from the episode record. Atomic batch with FrameCount. |
 | 0x1B | FTS Schema Version | Vault | `ws(8)` | NoSync | Tracks FTS schema version for migration gating. |
@@ -56,6 +56,9 @@ This document is the authoritative reference for every prefix in the system. Upd
 | 0x21 | Entity Relationship | Vault | `ws(8) \| engramID(16) \| fromHash(8) \| relTypeByte(1) \| toHash(8)` | NoSync | Typed relationship between two entities, scoped to an engram. |
 | 0x23 | Entity Reverse Index | Cross-vault | `nameHash(8) \| ws(8) \| engramID(16)` | NoSync | Entity←engram reverse lookup across vaults. Always written atomically with 0x20. |
 | 0x24 | Entity Co-occurrence | Vault | `ws(8) \| hashA(8) \| hashB(8)` | NoSync | Pairwise entity co-occurrence count. Hash pair is canonically ordered (hashA < hashB). |
+| 0x25 | Archived Association | Vault | `ws(8) \| src(16) \| dst(16)` | NoSync | Decayed association retained for bounded restoration. |
+| 0x26 | Relationship Entity Index | Vault | `ws(8) \| entityHash(8) \| engramID(16)` | NoSync | Routes entity-scoped relationship queries to source engrams. |
+| 0x27 | Durable External Identity | Vault | `ws(8) \| sha256(external_id)(32)` | Sync* | Immutable external ID → canonical payload hash + engram ID binding. The full external ID is retained in the value for collision detection. |
 
 \* Engram (0x01) and Metadata (0x02) default to Sync. When `NoSyncEngrams=true`, they move to NoSync tier (WAL syncer provides ≤10ms durability).
 
@@ -83,9 +86,9 @@ Added in the entity extraction pipeline. Entities are globally registered (0x1F)
 
 Derived indexes that accelerate filtered queries. Each maps a single attribute (lifecycle state, tag, creator, relevance score, contradiction relationship) to the set of engram IDs matching that value. These are always rebuildable from engram metadata — they are optimization structures, not source-of-truth data. The relevance bucket index (0x10) uses inverted bucket values so a forward Pebble scan returns the highest-relevance engrams first.
 
-### Configuration and Metadata (0x0E, 0x0F, 0x11, 0x12, 0x13, 0x15, 0x17, 0x19, 0x1D)
+### Configuration and Metadata (0x0E, 0x0F, 0x11, 0x12, 0x13, 0x15, 0x17, 0x19, 0x1D, 0x27)
 
-Singleton or low-cardinality keys that store per-vault configuration (vault name, scoring weights, migration versions, embedding model marker, coherence counter) and global operational state (vault name index, digest flags, idempotency receipts). The vault engram count (0x15) is the only key in this group that uses `pebble.Sync` — it enforces storage quotas and must survive crashes to prevent over-allocation.
+Singleton or low-cardinality keys that store per-vault configuration (vault name, scoring weights, migration versions, embedding model marker, coherence counter) and operational state (vault name index, digest flags, legacy receipts, durable external identities). Vault count (0x15) and external identity (0x27, atomically with its engram) use the engram durability tier.
 
 ### Structural Layer (0x16, 0x1A, 0x1C, 0x1E)
 
@@ -100,6 +103,7 @@ Several key groups are always written in the same Pebble `Batch` to maintain cro
 | Keys | Operation | Guarantee |
 |---|---|---|
 | 0x01 + 0x02 | `WriteEngram` | Engram body and metadata are never out of sync. |
+| 0x01 + 0x02 + 0x27 | externally identified `WriteEngram` / `WriteBatch` | The canonical engram and immutable external identity binding appear or disappear together. |
 | 0x20 + 0x23 | `WriteEntityEngramLink` | Forward and reverse entity links are never orphaned. |
 | 0x03 + 0x04 + 0x14 | `WriteAssociation` | All three association indexes reflect the same edge state. |
 | 0x1A frame + 0x1A FrameCount | `AppendFrame` | Frame content and the episode's frame counter advance atomically. Uses `pebble.Sync`. |

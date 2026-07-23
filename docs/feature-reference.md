@@ -51,7 +51,7 @@ A memory consists of:
 - **created_at** — custom timestamp (see below)
 - **embedding** — pre-computed vector (optional, system can compute it)
 - **associations** — initial links to other engrams
-- **idempotent_id** — dedup key for safe retries
+- **idempotent_id** — durable, vault-scoped external identity for safe retries. An identical canonical payload returns the original engram ID; changed payload fails with a conflict. See [Durable External Identity](external-identity.md).
 - **summary** — caller-provided one-line summary (skips background summarization)
 - **entities** — caller-provided entity list (skips background entity extraction)
 - **relationships** — caller-provided links to existing memories

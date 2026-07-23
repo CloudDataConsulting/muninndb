@@ -602,6 +602,18 @@ func (s *Server) handleCreateEngram(w http.ResponseWriter, r *http.Request) {
 	req.Vault = vault
 	resp, err := s.engine.Write(r.Context(), &req)
 	if err != nil {
+		if errors.Is(err, engine.ErrExternalIdentityConflict) {
+			s.sendError(r, w, http.StatusConflict, ErrInvalidEngram, err.Error())
+			return
+		}
+		if errors.Is(err, engine.ErrExternalIdentityUnsupportedPayload) {
+			s.sendError(r, w, http.StatusUnprocessableEntity, ErrInvalidEngram, err.Error())
+			return
+		}
+		if errors.Is(err, engine.ErrExternalIdentityClusterUnsupported) {
+			s.sendError(r, w, http.StatusServiceUnavailable, ErrStorageError, err.Error())
+			return
+		}
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
