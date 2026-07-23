@@ -115,9 +115,9 @@ func (a *grpcEngineAdapter) Activate(ctx context.Context, req *pb.ActivateReques
 	if err != nil {
 		return nil, err
 	}
-	items := make([]pb.ActivationItem, len(resp.Activations))
+	items := make([]*pb.ActivationItem, len(resp.Activations))
 	for i, item := range resp.Activations {
-		items[i] = pb.ActivationItem{
+		items[i] = &pb.ActivationItem{
 			ID: item.ID, Concept: item.Concept, Content: item.Content,
 			Score: item.Score, Why: item.Why,
 		}

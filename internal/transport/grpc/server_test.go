@@ -1545,7 +1545,7 @@ func TestActivate_Success(t *testing.T) {
 			return &pb.ActivateResponse{
 				QueryID:    "q-1",
 				TotalFound: 2,
-				Activations: []pb.ActivationItem{
+				Activations: []*pb.ActivationItem{
 					{ID: "e1", Concept: "concept1", Score: 0.9},
 					{ID: "e2", Concept: "concept2", Score: 0.7},
 				},

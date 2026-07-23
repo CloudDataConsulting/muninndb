@@ -94,7 +94,7 @@ func (c *muninnDBClient) Link(ctx context.Context, in *LinkRequest, opts ...grpc
 }
 
 func (c *muninnDBClient) Activate(ctx context.Context, in *ActivateRequest, opts ...grpc.CallOption) (MuninnDB_ActivateClient, error) {
-	stream, err := c.cc.NewStream(ctx, &grpc.StreamDesc{StreamName: "Activate"}, "/muninn.v1.MuninnDB/Activate", opts...)
+	stream, err := c.cc.NewStream(ctx, &MuninnDB_ServiceDesc.Streams[0], "/muninn.v1.MuninnDB/Activate", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +126,7 @@ func (x *muninnDBActivateClient) Recv() (*ActivateResponse, error) {
 }
 
 func (c *muninnDBClient) Subscribe(ctx context.Context, opts ...grpc.CallOption) (MuninnDB_SubscribeClient, error) {
-	stream, err := c.cc.NewStream(ctx, &grpc.StreamDesc{StreamName: "Subscribe"}, "/muninn.v1.MuninnDB/Subscribe", opts...)
+	stream, err := c.cc.NewStream(ctx, &MuninnDB_ServiceDesc.Streams[1], "/muninn.v1.MuninnDB/Subscribe", opts...)
 	if err != nil {
 		return nil, err
 	}
