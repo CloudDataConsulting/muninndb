@@ -40,6 +40,10 @@ func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*
 	if targetExists {
 		return nil, fmt.Errorf("start clone: target vault %q: %w", newName, ErrVaultNameCollision)
 	}
+	wsSource, err := e.store.ResolveExistingVaultPrefix(sourceVault)
+	if err != nil {
+		return nil, fmt.Errorf("start clone: resolve source workspace: %w", err)
+	}
 
 	// Reserve the target vault name before releasing the mutex.
 	// CloneVaultData no longer calls WriteVaultName; we do it here atomically.
@@ -57,8 +61,6 @@ func (e *Engine) StartClone(ctx context.Context, sourceVault, newName string) (*
 		}
 		return nil, fmt.Errorf("start clone: %w", err)
 	}
-
-	wsSource := e.store.VaultPrefix(sourceVault)
 
 	// Count engrams in source to set CopyTotal/IndexTotal for progress tracking.
 	sourceCount := e.store.GetVaultCount(ctx, wsSource)
@@ -186,14 +188,19 @@ func (e *Engine) StartMerge(ctx context.Context, sourceVault, targetVault string
 	if !targetFound {
 		return nil, fmt.Errorf("start merge: target vault %q: %w", targetVault, ErrVaultNotFound)
 	}
+	wsSource, err := e.store.ResolveExistingVaultPrefix(sourceVault)
+	if err != nil {
+		return nil, fmt.Errorf("start merge: resolve source workspace: %w", err)
+	}
+	wsTarget, err := e.store.ResolveExistingVaultPrefix(targetVault)
+	if err != nil {
+		return nil, fmt.Errorf("start merge: resolve target workspace: %w", err)
+	}
 
 	job, err := e.jobManager.Create("merge", sourceVault, targetVault)
 	if err != nil {
 		return nil, fmt.Errorf("start merge: %w", err)
 	}
-
-	wsSource := e.store.VaultPrefix(sourceVault)
-	wsTarget := e.store.VaultPrefix(targetVault)
 
 	sourceCount := e.store.GetVaultCount(ctx, wsSource)
 	job.CopyTotal = sourceCount

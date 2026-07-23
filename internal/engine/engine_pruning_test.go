@@ -6,11 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/engine/activation"
 	"github.com/scrypster/muninndb/internal/engine/trigger"
 	"github.com/scrypster/muninndb/internal/index/fts"
 	"github.com/scrypster/muninndb/internal/storage"
+	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
 // ptr is a generic helper to take the address of any value.
@@ -46,6 +48,33 @@ func testEnvWithAuth(t *testing.T) (*Engine, *auth.Store, *storage.PebbleStore, 
 		eng.Stop()
 		store.Close()
 		os.RemoveAll(dir)
+	}
+}
+
+func TestPruneVault_StrictPersistedWorkspaceResolution(t *testing.T) {
+	eng, _, store, cleanup := testEnvWithAuth(t)
+	defer cleanup()
+	ctx := context.Background()
+	const vault = "prune-strict-resolution"
+
+	resp, err := eng.Write(ctx, writeReq(vault, "preserve", "must not prune through a corrupt name index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := store.ResolveVaultPrefix(vault) // populate permissive cache
+	if err := store.GetDB().Delete(keys.VaultNameIndexKey(vault), pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.PruneVault(ctx, vault); err == nil {
+		t.Fatal("PruneVault trusted permissive cache after persisted name-index deletion")
+	}
+	id, err := storage.ParseULID(resp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetEngram(ctx, ws, id); err != nil {
+		t.Fatalf("PruneVault mutated data despite strict-resolution failure: %v", err)
 	}
 }
 

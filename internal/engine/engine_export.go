@@ -30,7 +30,10 @@ func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel strin
 		return nil, fmt.Errorf("export vault %q: %w", vaultName, ErrVaultNotFound)
 	}
 
-	ws := e.store.VaultPrefix(vaultName)
+	ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return nil, fmt.Errorf("export vault %q: resolve persisted workspace: %w", vaultName, err)
+	}
 	opts := storage.ExportOpts{
 		EmbedderModel: embedderModel,
 		Dimension:     dimension,

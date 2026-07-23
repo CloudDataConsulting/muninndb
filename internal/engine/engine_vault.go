@@ -48,7 +48,10 @@ func (e *Engine) ClearVault(ctx context.Context, vaultName string) error {
 		return fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
 	}
 
-	ws := e.store.VaultPrefix(vaultName)
+	ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return fmt.Errorf("clear vault: resolve persisted workspace: %w", err)
+	}
 
 	// NOTE: Jobs already mid-flush may write ghost FTS entries after the range
 	// tombstones land. This is harmless — activation filtering skips engrams
@@ -107,10 +110,8 @@ var ErrVaultJobActive = fmt.Errorf("vault has an active clone/merge job in progr
 // It calls ClearVault (which adjusts engramCount and in-memory state),
 // then deletes the vault name keys from storage.
 //
-// Note: ws must be captured BEFORE calling ClearVault, because ClearVault
-// evicts vaultPrefixCache for the vault name. After ClearVault,
-// store.VaultPrefix would still return the SipHash but the name is no longer
-// registered — DeleteVaultNameOnly needs the ws captured before eviction.
+// Note: ws must be resolved BEFORE calling ClearVault, because renamed vaults
+// retain their original workspace and ClearVault evicts workspace caches.
 func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 	// Reject deletion if a clone/merge job is actively writing into this vault
 	// (i.e., the vault is the Target of a running job). Deleting a vault that is
@@ -121,10 +122,22 @@ func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 	}
 
 	// Capture ws BEFORE ClearVault evicts the in-memory name cache.
-	ws := e.store.VaultPrefix(vaultName)
+	ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return fmt.Errorf("delete vault: resolve persisted workspace: %w", err)
+	}
 
 	if err := e.ClearVault(ctx, vaultName); err != nil {
 		return fmt.Errorf("delete vault (clear phase): %w", err)
+	}
+
+	// Auth cleanup must succeed before the storage name is released for reuse.
+	// This is temporary name-bound containment; durable lifecycle identity and a
+	// cross-store write fence remain follow-on work.
+	if e.authStore != nil {
+		if err := e.authStore.DeleteVaultLifecycle(vaultName); err != nil {
+			return fmt.Errorf("delete vault (auth cleanup): %w", err)
+		}
 	}
 
 	if err := e.store.DeleteVaultNameOnly(ctx, vaultName, ws); err != nil {
@@ -142,13 +155,6 @@ func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 	// before it ever uses the mutex. The re-insertion/deletion race window is
 	// therefore harmless in practice.
 	e.vaultMu.Delete(vaultName)
-
-	// Auth config: remove config entry if present.
-	if e.authStore != nil {
-		if err := e.authStore.DeleteVaultConfig(vaultName); err != nil {
-			slog.Warn("delete vault: auth config cleanup failed", "vault", vaultName, "err", err)
-		}
-	}
 
 	return nil
 }
@@ -187,7 +193,19 @@ func (e *Engine) RenameVault(ctx context.Context, oldName, newName string) error
 		return fmt.Errorf("rename vault %q: %w", oldName, ErrVaultJobActive)
 	}
 
-	ws := e.store.ResolveVaultPrefix(oldName)
+	ws, err := e.store.ResolveExistingVaultPrefix(oldName)
+	if err != nil {
+		return fmt.Errorf("rename vault: resolve persisted workspace: %w", err)
+	}
+
+	// Revoke old-name credentials before storage releases oldName. If a later
+	// storage rename fails, the availability loss is fail-closed; credentials
+	// from the old lifecycle must never authorize an immediate same-name reuse.
+	if e.authStore != nil {
+		if err := e.authStore.RevokeVaultAPIKeys(oldName); err != nil {
+			return fmt.Errorf("rename vault auth revocation: %w", err)
+		}
+	}
 
 	// Storage: atomic batch rename.
 	if err := e.store.RenameVault(ws, oldName, newName); err != nil {

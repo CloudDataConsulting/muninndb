@@ -50,6 +50,12 @@ func (s *Store) GetVaultConfig(vault string) (VaultConfig, error) {
 
 // SetVaultConfig persists the vault configuration.
 func (s *Store) SetVaultConfig(cfg VaultConfig) error {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	return s.setVaultConfig(cfg)
+}
+
+func (s *Store) setVaultConfig(cfg VaultConfig) error {
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal vault config: %w", err)
@@ -60,6 +66,9 @@ func (s *Store) SetVaultConfig(cfg VaultConfig) error {
 // RenameVaultConfig moves a vault's config from oldName to newName.
 // If no config exists for oldName, this is a no-op (returns nil).
 func (s *Store) RenameVaultConfig(oldName, newName string) error {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+
 	cfg, err := s.GetVaultConfig(oldName)
 	if err != nil {
 		return nil // no config → no-op
@@ -93,6 +102,8 @@ func (s *Store) RenameVaultConfig(oldName, newName string) error {
 // DeleteVaultConfig removes the vault configuration for the named vault.
 // If no config exists for the vault, this is a no-op and returns nil (idempotent).
 func (s *Store) DeleteVaultConfig(name string) error {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
 	return s.db.Delete(vaultConfigKey(name), pebble.Sync)
 }
 

@@ -40,7 +40,10 @@ func (e *Engine) ReindexFTSVault(ctx context.Context, vaultName string) (int64, 
 		return 0, fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
 	}
 
-	ws := e.store.VaultPrefix(vaultName)
+	ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return 0, fmt.Errorf("reindex-fts: resolve persisted workspace: %w", err)
+	}
 
 	// Prevent the FTS worker from submitting new jobs during the re-index window.
 	if e.ftsWorker != nil {
@@ -108,4 +111,3 @@ func (e *Engine) ReindexFTSVault(ctx context.Context, vaultName string) (int64, 
 	slog.Info("reindex-fts: complete", "vault", vaultName, "engrams", indexed)
 	return indexed, nil
 }
-

@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -11,7 +12,8 @@ import (
 
 // Store provides auth persistence on top of the shared Pebble database.
 type Store struct {
-	db *pebble.DB
+	db          *pebble.DB
+	lifecycleMu sync.RWMutex
 }
 
 func NewStore(db *pebble.DB) *Store {

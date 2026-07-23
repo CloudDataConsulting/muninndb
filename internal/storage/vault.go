@@ -66,6 +66,39 @@ func (ps *PebbleStore) ResolveVaultPrefix(name string) [8]byte {
 	return ws
 }
 
+// ResolveExistingVaultPrefix strictly resolves an already-registered vault.
+// Unlike ResolveVaultPrefix, it never falls back to a name-derived SipHash and
+// never trusts the in-memory cache without re-reading persisted lifecycle keys.
+// Destructive and bulk existing-vault operations use this path so a missing,
+// corrupt, or mismatched 0x0F/0x0E pair fails closed.
+func (ps *PebbleStore) ResolveExistingVaultPrefix(name string) ([8]byte, error) {
+	idxKey := keys.VaultNameIndexKey(name)
+	value, closer, err := ps.db.Get(idxKey)
+	if err != nil {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: name index: %w", name, err)
+	}
+	if len(value) != 8 {
+		closer.Close()
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: name index length %d, want 8", name, len(value))
+	}
+	var ws [8]byte
+	copy(ws[:], value)
+	closer.Close()
+
+	metaValue, metaCloser, err := ps.db.Get(keys.VaultMetaKey(ws))
+	if err != nil {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: metadata: %w", name, err)
+	}
+	storedName := string(metaValue)
+	metaCloser.Close()
+	if storedName != name {
+		return [8]byte{}, fmt.Errorf("resolve existing vault %q: metadata names %q", name, storedName)
+	}
+
+	ps.vaultPrefixCache.Add(name, ws)
+	return ws, nil
+}
+
 // BackfillVaultNames scans all 0x01 engram keys, finds vault prefixes that have
 // no 0x0E meta key, and writes a placeholder name for each. Called once on startup
 // so that legacy data (written before vault-name persistence) is discoverable.

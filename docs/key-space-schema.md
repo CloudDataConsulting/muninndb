@@ -1,14 +1,14 @@
 # Key-Space Schema
 
-MuninnDB stores all state in a single Pebble instance using a prefix-partitioned key space. Each prefix byte (0x01–0x24) identifies a distinct data type, and keys are constructed by dedicated functions in the `storage` package — never assembled ad hoc. Most prefixes are vault-scoped: the key begins with a workspace prefix (`wsPrefix`) derived from a SipHash of the vault name. A handful of prefixes are global (cross-vault) and omit the workspace prefix entirely.
+MuninnDB stores all state in a single Pebble instance using a prefix-partitioned key space. Current storage keys extend through 0x26, with unrelated operational records at 0xFF. A first byte is not always a unique owner: legacy auth/storage overlap exists at 0x11–0x14, and several subsystems share 0x19 and 0xFF. Most storage prefixes are vault-scoped and begin with an eight-byte workspace prefix (`wsPrefix`). A vault's initial workspace is derived from its original name, but rename preserves that persisted workspace.
 
-This document is the authoritative reference for every prefix in the system. Update it before merging any change that introduces or modifies a key layout.
+The immutable lifecycle inventory and clear policy in `internal/storage/keyspace_registry.go` is the code authority for physical ownership relevant to vault clearing. This document is its human-readable companion. Update both before merging a change that introduces or modifies a key layout.
 
 ---
 
 ## Key Scoping Model
 
-**Vault-scoped keys** follow the pattern: `prefix(1) | wsPrefix(8) | ...payload`. The `wsPrefix` is an 8-byte SipHash of the vault name, providing constant-size namespace isolation without embedding variable-length vault names in every key.
+**Vault-scoped keys** follow the pattern: `prefix(1) | wsPrefix(8) | ...payload`. The persisted `wsPrefix` provides constant-size namespace isolation without embedding variable-length vault names in every key. Existing-vault destructive and bulk operations must resolve and validate the persisted 0x0F→0x0E mapping; they must not recompute a workspace from the current name.
 
 **Global keys** follow the pattern: `prefix(1) | ...payload`. These store data that spans vaults (the entity registry, idempotency receipts, vault name index, digest flags).
 
@@ -36,15 +36,15 @@ This document is the authoritative reference for every prefix in the system. Upd
 | 0x0E | Vault Metadata | Vault | `ws(8)` | NoSync | Vault display name and configuration. |
 | 0x0F | Vault Name Index | Global | `siphash(name)(8)` | NoSync | Reverse lookup: vault name → workspace prefix. |
 | 0x10 | Relevance Bucket | Vault | `ws(8) \| bucket(1) \| id(16)` | NoSync | Secondary index on relevance score. Bucket is inverted for descending scan order. |
-| 0x11 | Digest Flags | Global | `id(16)` | NoSync | Per-engram digest/processing flags. |
-| 0x12 | Coherence Counter | Vault | `ws(8)` | NoSync | Incremental coherence tracking counter per vault. |
-| 0x13 | Scoring Weights | Vault | `ws(8)` | NoSync | Vault-level Hebbian scoring weight vector. |
-| 0x14 | Assoc Weight Lookup | Vault | `ws(8) \| src(16) \| dst(16)` | NoSync | O(1) weight lookup for a specific (src, dst) pair. |
+| 0x11 | Digest Flags / Auth Admin | Global + reserved overlap | Storage: `id(16)`; auth: `username(variable)` | Mixed | Global digest flags and legacy auth admin records share the byte. Vault clear preserves the entire prefix. |
+| 0x12 | Coherence Counter / Auth API Key | Vault + reserved overlap | Storage: `ws(8)`; auth: `storageHash(16)` | Mixed | Vault clear point-deletes only the exact nine-byte coherence key; it never range-deletes this shared prefix. |
+| 0x13 | Scoring Weights / Auth Vault Index | Vault + reserved overlap | Storage: `ws(8)`; auth: `vaultName \| 0x00 \| keyID(8)` | Mixed | Vault clear point-deletes only the exact nine-byte weights key. |
+| 0x14 | Assoc Weight Lookup / Auth Vault Config | Vault + reserved overlap | Storage: `ws(8) \| src(16) \| dst(16)` with 4-byte value; auth: `vaultName(variable)` with JSON value | Mixed | O(1) association lookup plus auth config. Clear uses value-aware point deletion; physical namespace separation remains required. |
 | 0x15 | Vault Engram Count | Vault | `ws(8)` | **Sync** | Engram count for quota enforcement. Must survive crashes. |
 | 0x16 | Provenance | Vault | `ws(8) \| id(16) \| ts_ns(8) \| seq(4)` | NoSync | Append-only audit trail entries. |
 | 0x17 | Bucket Migration | Vault | `ws(8)` | NoSync | Tracks which relevance-bucket migration version has been applied. |
 | 0x18 | Quantized Embedding | Vault | `ws(8) \| id(16)` | NoSync | Standalone quantized vector for similarity search. |
-| 0x19 | Idempotency Receipt | Global | `siphash(op_id)(8)` | NoSync | Duplicate-request guard. TTL-expired by background sweep. |
+| 0x19 | Shared Global Operations | Global overlap | Multiple layouts; see below | Mixed | Idempotency, replication log/counter/metadata/snapshot state, and Hebbian metadata reservation currently share this byte. Never vault-cleared. |
 | 0x1A | Episode Record | Vault | `ws(8) \| episodeID(16)` | NoSync | Episode metadata (create/close lifecycle). |
 | 0x1A+0xFF | Episode Frame | Vault | `ws(8) \| episodeID(16) \| 0xFF \| position(4)` | **Sync** | Ordered frame within an episode. 0xFF separator distinguishes frames from the episode record. Atomic batch with FrameCount. |
 | 0x1B | FTS Schema Version | Vault | `ws(8)` | NoSync | Tracks FTS schema version for migration gating. |
@@ -54,10 +54,30 @@ This document is the authoritative reference for every prefix in the system. Upd
 | 0x1F | Entity Registry | Global | `nameHash(8)` | NoSync | Global entity record. Confidence-preserving merge on conflict. |
 | 0x20 | Entity Forward Link | Vault | `ws(8) \| engramID(16) \| nameHash(8)` | NoSync | Engram→entity link. Always written atomically with 0x23. |
 | 0x21 | Entity Relationship | Vault | `ws(8) \| engramID(16) \| fromHash(8) \| relTypeByte(1) \| toHash(8)` | NoSync | Typed relationship between two entities, scoped to an engram. |
+| 0x22 | Last Access Index | Vault | `ws(8) \| invertedMillis(8) \| engramID(16)` | NoSync | Derived index sorted most-recent access first. |
 | 0x23 | Entity Reverse Index | Cross-vault | `nameHash(8) \| ws(8) \| engramID(16)` | NoSync | Entity←engram reverse lookup across vaults. Always written atomically with 0x20. |
 | 0x24 | Entity Co-occurrence | Vault | `ws(8) \| hashA(8) \| hashB(8)` | NoSync | Pairwise entity co-occurrence count. Hash pair is canonically ordered (hashA < hashB). |
+| 0x25 | Archived Association | Vault | `ws(8) \| src(16) \| dst(16)` | NoSync | Canonical archived outbound association history. |
+| 0x26 | Relationship Entity Index | Vault | `ws(8) \| entityHash(8) \| engramID(16)` | NoSync | Derived reverse index for relationships involving an entity. |
+| 0xFF | Shared Operational Reservation | Global overlap | Migration: `"mig_ver"`; MOL: `"last_mol_seq"` | Mixed | Migration runner and memory-operation-log sequence metadata. Never vault-cleared. |
 
 \* Engram (0x01) and Metadata (0x02) default to Sync. When `NoSyncEngrams=true`, they move to NoSync tier (WAL syncer provides ≤10ms durability).
+
+## Auth overlap and lifecycle ownership
+
+Auth and storage use the same Pebble database. Auth owns reserved layouts under 0x11–0x14, while storage owns other layouts under the same first bytes. Until namespace migration separates them:
+
+- storage vault clearing must not delete auth records;
+- 0x12 coherence and 0x13 weights use exact nine-byte point deletes;
+- 0x14 association-weight records use an exact 41-byte key plus four-byte value match and point deletes, never a range tombstone;
+- auth lifecycle cleanup remains auth-owned and must validate both API-key records and vault indexes before one Sync batch;
+- these containment rules do not provide durable vault identity, lifecycle generation, or a process-independent write fence.
+
+The 0x19 byte also has multiple owners: the exact nine-byte idempotency receipt overlaps the replication log's exact nine-byte sequence layout; reserved sublayouts hold Hebbian metadata (`0x01`), replication last-applied (`0x02`), cluster/schema metadata (`0x03`), and snapshot completion (`0x10`). Migration issue #138 owns physical separation. Vault lifecycle operations preserve all 0x19 and 0xFF records.
+
+## Vault clear policy
+
+`ClearVault` consumes the immutable registry clear plan. Vault-first namespaces use range tombstones except the shared auth bytes above. The 0x23 reverse index is cross-vault (`ws` at bytes 9:17), so clear validates the current exact 33-byte layout and point-deletes only matching workspace keys in the same Pebble batch. Malformed owned 0x23 layouts abort before the batch commits.
 
 ---
 
@@ -75,7 +95,7 @@ Weighted, directed edges between engrams. The forward index (0x03) stores edges 
 
 A self-contained FTS engine built on Pebble primitives. Posting lists (0x05) map terms to engram IDs. Trigram indexes (0x06) support fuzzy and substring queries. HNSW neighbor lists (0x07) back the approximate nearest-neighbor graph for vector search. Global stats (0x08) and per-term stats (0x09) feed BM25 scoring. The schema version marker (0x1B) gates FTS migrations.
 
-### Entity Graph Layer (0x1F, 0x20, 0x21, 0x23, 0x24)
+### Entity Graph Layer (0x1F, 0x20, 0x21, 0x23, 0x24, 0x26)
 
 Added in the entity extraction pipeline. Entities are globally registered (0x1F) with confidence-preserving merge semantics — if two vaults extract the same entity, the higher confidence wins. Forward links (0x20) and reverse links (0x23) connect engrams to entities bidirectionally and are always written as an atomic pair. Relationship records (0x21) capture typed relations (manages, depends_on, contradicts, etc.) between entity pairs scoped to a source engram. Co-occurrence counts (0x24) track how often two entities appear together, using canonically ordered hash pairs to avoid duplicates.
 
@@ -83,7 +103,7 @@ Added in the entity extraction pipeline. Entities are globally registered (0x1F)
 
 Derived indexes that accelerate filtered queries. Each maps a single attribute (lifecycle state, tag, creator, relevance score, contradiction relationship) to the set of engram IDs matching that value. These are always rebuildable from engram metadata — they are optimization structures, not source-of-truth data. The relevance bucket index (0x10) uses inverted bucket values so a forward Pebble scan returns the highest-relevance engrams first.
 
-### Configuration and Metadata (0x0E, 0x0F, 0x11, 0x12, 0x13, 0x15, 0x17, 0x19, 0x1D)
+### Configuration and Metadata (0x0E, 0x0F, 0x11, 0x12, 0x13, 0x15, 0x17, 0x19, 0x1D, 0xFF)
 
 Singleton or low-cardinality keys that store per-vault configuration (vault name, scoring weights, migration versions, embedding model marker, coherence counter) and global operational state (vault name index, digest flags, idempotency receipts). The vault engram count (0x15) is the only key in this group that uses `pebble.Sync` — it enforces storage quotas and must survive crashes to prevent over-allocation.
 
@@ -141,11 +161,11 @@ The entity relationship prefix (0x21) encodes the relationship type as a single 
 
 ## Rules for Adding a New Key Space
 
-1. **Pick a prefix byte.** Choose the next unused byte. Check this document and `grep` for existing `keyPrefix` constants in the `storage` package. Never reuse a prefix, even if the old one was "removed" — data may still exist on disk.
+1. **Pick a prefix byte.** Choose the next unused byte. Check this document, `internal/storage/keyspace_registry.go`, and all persistence packages. Never copy the legacy 0x11–0x14, 0x19, or 0xFF overlap pattern; data may already exist under every reserved layout.
 
 2. **Document it here.** Add a row to the Complete Prefix Table and a description in the appropriate layer section before the code review.
 
-3. **Implement a key construction function.** All key assembly lives in the `storage` package (typically `keys.go`). Never build keys with raw byte concatenation outside that package.
+3. **Implement a key construction function and registry descriptor.** Storage key assembly normally lives under `internal/storage/keys`; other owning packages keep their own constructors. Add explicit scope, owner, layout, and clear behavior to the immutable registry. Do not add runtime registration or a generic raw-write API.
 
 4. **Choose a durability tier.** Default to `pebble.NoSync` unless the data is a source of truth that cannot be re-derived. If you choose `pebble.Sync`, document why in the code and add it to `docs/durability-guarantees.md`.
 

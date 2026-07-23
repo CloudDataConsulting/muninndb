@@ -45,7 +45,10 @@ func (e *Engine) StartReembedVault(ctx context.Context, vaultName, modelName str
 		return nil, fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
 	}
 
-	ws := e.store.VaultPrefix(vaultName)
+	ws, err := e.store.ResolveExistingVaultPrefix(vaultName)
+	if err != nil {
+		return nil, fmt.Errorf("reembed: resolve persisted workspace: %w", err)
+	}
 
 	// Count engrams to set progress totals.
 	engramCount := e.store.GetVaultCount(ctx, ws)

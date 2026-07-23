@@ -358,6 +358,38 @@ func TestEngineRenameVault_AuthConfigMoved(t *testing.T) {
 	}
 }
 
+func TestEngineRenameVault_RevokesOldLifecycleCredentialsBeforeNameReuse(t *testing.T) {
+	eng, authStore, _, cleanup := testEnvWithAuth(t)
+	defer cleanup()
+	ctx := context.Background()
+	const oldName = "auth-rename-key-src"
+	const newName = "auth-rename-key-dst"
+
+	if _, err := eng.Write(ctx, writeReq(oldName, "concept", "content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := authStore.SetVaultConfig(auth.VaultConfig{Name: oldName, Public: false}); err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := authStore.GenerateAPIKey(oldName, "old lifecycle", auth.ModeFull, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := eng.RenameVault(ctx, oldName, newName); err != nil {
+		t.Fatalf("RenameVault: %v", err)
+	}
+	if _, err := authStore.ValidateAPIKey(token); err == nil {
+		t.Fatal("old lifecycle token still validates after rename")
+	}
+	if err := authStore.SetVaultConfig(auth.VaultConfig{Name: oldName, Public: false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authStore.ValidateAPIKey(token); err == nil {
+		t.Fatal("old lifecycle token authorizes same-name recreation after rename")
+	}
+}
+
 // TestEngineRenameVault_CoherenceCountersMoved verifies that RenameVault
 // transfers coherence counters from old name to new name.
 func TestEngineRenameVault_CoherenceCountersMoved(t *testing.T) {

@@ -19,6 +19,9 @@ var ErrKeyNotFound = errors.New("api key not found")
 // Returns the raw token (shown once) and the key metadata.
 // expiresAt is optional; pass nil for a key that never expires.
 func (s *Store) GenerateAPIKey(vault, label, mode string, expiresAt *time.Time) (token string, key APIKey, err error) {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+
 	if mode != ModeFull && mode != ModeObserve && mode != ModeWrite {
 		err = fmt.Errorf("mode must be %q, %q, or %q", ModeFull, ModeObserve, ModeWrite)
 		return
@@ -130,6 +133,9 @@ func (s *Store) ListAPIKeys(vault string) ([]APIKey, error) {
 // RevokeAPIKey removes the key with the given display ID from the given vault.
 // Returns ErrKeyNotFound if the key does not exist or the ID is invalid.
 func (s *Store) RevokeAPIKey(vault, keyID string) error {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+
 	idBytes, err := base64.RawURLEncoding.DecodeString(keyID)
 	if err != nil || len(idBytes) != 8 {
 		return ErrKeyNotFound
